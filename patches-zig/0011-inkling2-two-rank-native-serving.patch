@@ -1,0 +1,2420 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:49:54 +1100
+Subject: [PATCH 11/45] inkling2: two-rank native serving
+
+Rank 0 serves and sends each step (prompt chunk, shared decode window, keep, kept state) to rank 1
+by NCCL; rank 1 follows and sleeps on its line when idle. Decode windows of several streams share
+one forward and run as CUDA graphs keyed by rows, streams, tiles and the partials' stride; global
+layers launch a fixed chunk count so a graph replays across chunk edges. Kept prompt states copy a
+slot's sliding rings and conv states and leave its global rows in place. Greedy picks and sampled
+draws (main's sample.cu on whole bf16 rows) agree across ranks. tf-inkling2-engine checks graphs
+against eager and writes greedy tokens.
+---
+ zig/build/cuda.zig                         |   2 +-
+ zig/build/cuda_engines.zig                 |   1 +
+ zig/build/cuda_family_host.zig             |   2 +-
+ zig/build/inkling2.zig                     |  31 +-
+ zig/kernels/cuda/inkling2/attention.cu     |   7 +-
+ zig/kernels/cuda/inkling2/ops.cu           |  73 +++++
+ zig/src/core/profile.zig                   |   2 +-
+ zig/src/families/inkling2/dump_main.zig    |   2 +-
+ zig/src/families/inkling2/engine.zig       | 340 +++++++++++++++++++++
+ zig/src/families/inkling2/engine_main.zig  | 161 ++++++++++
+ zig/src/families/inkling2/follow.zig       | 282 +++++++++++++++++
+ zig/src/families/inkling2/forward.zig      | 183 +++++++----
+ zig/src/families/inkling2/inkling2.zig     |  13 +
+ zig/src/families/inkling2/kept.zig         | 122 ++++++++
+ zig/src/families/inkling2/kernels.zig      |  40 ++-
+ zig/src/families/inkling2/kernels_test.zig |  18 +-
+ zig/src/families/inkling2/lanes.zig        | 265 ++++++++++++++++
+ zig/src/families/inkling2/native.zig       | 245 +++++++++++++++
+ zig/src/families/inkling2/ops.zig          |  43 +++
+ zig/src/families/inkling2/sampler.zig      | 107 +++++++
+ zig/src/native/cuda_families.zig           |   2 +-
+ 21 files changed, 1828 insertions(+), 113 deletions(-)
+ create mode 100644 zig/src/families/inkling2/engine.zig
+ create mode 100644 zig/src/families/inkling2/engine_main.zig
+ create mode 100644 zig/src/families/inkling2/follow.zig
+ create mode 100644 zig/src/families/inkling2/kept.zig
+ create mode 100644 zig/src/families/inkling2/lanes.zig
+ create mode 100644 zig/src/families/inkling2/native.zig
+ create mode 100644 zig/src/families/inkling2/sampler.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 8e22621..c000cec 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -109,7 +109,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
+     runner.addImport("glm_cuda", glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api));
+     @import("minimax_cuda.zig").targets(b, target, optimize, strip, cuda, mods.core, mods.lanes, runner);
+-    @import("inkling2.zig").targets(b, target, optimize, strip, cuda, mods.core, runner);
++    @import("inkling2.zig").targets(b, target, optimize, strip, cuda, mods.core, mods.lanes, runner);
+     for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
+     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+     runner.addImport("spark25", @import("spark25.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+diff --git a/zig/build/cuda_engines.zig b/zig/build/cuda_engines.zig
+index 9c5c49a..7b357a0 100644
+--- a/zig/build/cuda_engines.zig
++++ b/zig/build/cuda_engines.zig
+@@ -64,6 +64,7 @@ pub fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision, api) },
+             .{ .name = "glm_cuda", .module = glmCudaShared(b, target, optimize, cuda, core, lanes, heat, api, canon, verbs) },
+             .{ .name = "minimax_m3_cuda", .module = @import("minimax_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
++            .{ .name = "inkling2", .module = @import("inkling2.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "qwen35", .module = qwen35 },
+             .{ .name = "kolibri1", .module = @import("kolibri.zig").module(b, target, optimize, cuda, core, lanes) },
+             .{ .name = "gemma4_cuda", .module = @import("gemma4_cuda.zig").module(b, target, optimize, cuda, core, lanes) },
+diff --git a/zig/build/cuda_family_host.zig b/zig/build/cuda_family_host.zig
+index 921ddd3..acce047 100644
+--- a/zig/build/cuda_family_host.zig
++++ b/zig/build/cuda_family_host.zig
+@@ -17,7 +17,7 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
+ 
+     b.step("test-qwen35-request-starts-host", "Request-start and shared-KV startup refusal without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"request starts:"} })).step);
+     @import("minimax_cuda.zig").hostTests(b, host, cuda, mods.core, mods.lanes, step);
+-    @import("inkling2.zig").hostTests(b, host, cuda, mods.core, step);
++    @import("inkling2.zig").hostTests(b, host, cuda, mods.core, mods.lanes, step);
+     @import("cuda_groups_host.zig").host(b, cuda, mods, step);
+     const prefill = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"Qwen stepped prefill:"} }));
+     b.step("test-qwen35-prefill-host", "Interrupted stepped prompt lifecycle without devices").dependOn(&prefill.step);
+diff --git a/zig/build/inkling2.zig b/zig/build/inkling2.zig
+index 3c06dcd..407aa97 100644
+--- a/zig/build/inkling2.zig
++++ b/zig/build/inkling2.zig
+@@ -1,28 +1,31 @@
+-//! Inkling 2's CUDA family in the build: its module and its host regressions.
++//! Inkling 2's CUDA family in the build: its module, its check tools and its host regressions.
+ const std = @import("std");
+ 
+-/// The Inkling 2 CUDA family over the runtime and the core.
+-pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
++/// The Inkling 2 CUDA family over the runtime, the core and the lane core.
++pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
+     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/inkling2.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     m.addImport("cuda", cuda);
+     m.addImport("core", core);
++    m.addImport("lanes", lanes);
+     return m;
+ }
+ 
+-/// The family in tf-cuda-test's `runner`, and tf-inkling2-cuda (every row's logits for the exllamav3 reference).
+-pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, core: *std.Build.Module, runner: *std.Build.Module) void {
+-    runner.addImport("inkling2", module(b, target, optimize, cuda, core));
+-    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/dump_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+-    m.addImport("cuda", cuda);
+-    m.addImport("inkling2", module(b, target, optimize, cuda, core));
+-    const exe = b.addExecutable(.{ .name = "tf-inkling2-cuda", .root_module = m });
+-    b.installArtifact(exe);
+-    b.step("tf-inkling2-cuda", "Inkling 2's CUDA forward rows for the exllamav3 reference").dependOn(&b.addInstallArtifact(exe, .{}).step);
++/// The family in tf-cuda-test's `runner`; tf-inkling2-cuda (forward rows) and tf-inkling2-engine (engine checks).
++pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, runner: *std.Build.Module) void {
++    runner.addImport("inkling2", module(b, target, optimize, cuda, core, lanes));
++    for ([_][2][]const u8{ .{ "tf-inkling2-cuda", "dump_main.zig" }, .{ "tf-inkling2-engine", "engine_main.zig" } }) |t| {
++        const m = b.createModule(.{ .root_source_file = b.path(b.fmt("zig/src/families/inkling2/{s}", .{t[1]})), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
++        m.addImport("cuda", cuda);
++        m.addImport("inkling2", module(b, target, optimize, cuda, core, lanes));
++        const exe = b.addExecutable(.{ .name = t[0], .root_module = m });
++        b.installArtifact(exe);
++        b.step(t[0], "Inkling 2's CUDA check tools: forward rows, engine graphs").dependOn(&b.addInstallArtifact(exe, .{}).step);
++    }
+ }
+ 
+ /// The family's host regressions (config, chat wiring, reply split, admission, the attention plan) in `all`.
+-pub fn hostTests(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Module, core: *std.Build.Module, all: *std.Build.Step) void {
+-    const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, core) }));
++pub fn hostTests(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, all: *std.Build.Step) void {
++    const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, core, lanes) }));
+     b.step("test-inkling2-cuda-host", "Inkling 2's CUDA family host regressions (no GPU work)").dependOn(&run.step);
+     all.dependOn(&run.step);
+ }
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index f6fbe7a..c5f1c18 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -122,13 +122,14 @@ extern "C" __global__ void __launch_bounds__(128)
+     __shared__ __align__(16) uint16_t vs[kKeys * kPad];
+     const int2 tile = tiles[blockIdx.x];
+     const Seg s = segs[tile.x];
+-    const int kvh = blockIdx.y, c = c0 + static_cast<int>(blockIdx.z);
+     const int group = heads / kv_heads;
+     const int total = s.n * group;
+     const int m0 = tile.y;
+     const int m_last = min(m0 + 63, total - 1);
+     const int tile_hi = s.p0 + m_last / group;
+     const int tile_lo = window > 0 ? max(0, s.p0 + m0 / group - window + 1) : 0;
++    // sliding layers count chunks from the tile's first key and store them from each row's first chunk
++    const int kvh = blockIdx.y, c = (window > 0 ? tile_lo / chunk : c0) + static_cast<int>(blockIdx.z);
+     const int c_lo = c * chunk, c_hi = c_lo + chunk - 1;
+     if (c_lo > tile_hi || c_hi < tile_lo) return;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+@@ -234,7 +235,7 @@ extern "C" __global__ void __launch_bounds__(128)
+         l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+         l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+         if (!ok[i]) continue;
+-        const size_t at = prow[i] * chunks + (c - c0);
++        const size_t at = prow[i] * chunks + (c - (window > 0 ? lo[i] / chunk : c0));
+         if (t == 0) part_ml[at] = make_float2(m[i], l[i]);
+         float* o = part_o + at * kDim + 2 * t;
+         for (int n = 0; n < 16; ++n) *reinterpret_cast<float2*>(o + 8 * n) = make_float2(acc[n][2 * i], acc[n][2 * i + 1]);
+@@ -253,7 +254,7 @@ extern "C" __global__ void tf_ink2_merge(const float* __restrict__ part_o, const
+     const int lo = window > 0 ? max(0, pos - window + 1) : 0;
+     float mm = -INFINITY, ll = 0.0f, o = 0.0f;
+     for (int c = lo / chunk; c <= pos / chunk; ++c) {
+-        const size_t at = rh * chunks + (c - c0);
++        const size_t at = rh * chunks + (c - (window > 0 ? lo / chunk : c0));
+         const float2 ml = part_ml[at];
+         const float mn = fmaxf(mm, ml.x);
+         const float a = exp2f(mm - mn), b = exp2f(ml.x - mn);
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index 51e0d82..0a667c7 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -307,3 +307,76 @@ extern "C" __global__ void tf_ink2_softcap(float* __restrict__ x, long long n, f
+     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+     if (i < n) x[i] = tanhf(x[i] / cap) * cap;
+ }
++
++namespace ink2o {
++
++__device__ __forceinline__ bool better(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }
++
++}  // namespace ink2o
++
++// Each row's greedy pick over its first n fp32 columns: the largest value, the lowest id among equals, plus base.
++extern "C" __global__ void __launch_bounds__(1024) tf_ink2_top1(const float* __restrict__ x, long long stride, int n,
++                                                                int base, float* __restrict__ val, int* __restrict__ id) {
++    using namespace ink2o;
++    __shared__ float sv[32];
++    __shared__ int si[32];
++    const float* r = x + static_cast<size_t>(blockIdx.x) * stride;
++    float bv = -INFINITY;
++    int bi = 0x7fffffff;
++    for (int i = threadIdx.x; i < n; i += blockDim.x) {
++        if (better(r[i], i, bv, bi)) {
++            bv = r[i];
++            bi = i;
++        }
++    }
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++        if (better(ov, oi, bv, bi)) {
++            bv = ov;
++            bi = oi;
++        }
++    }
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    if (lane == 0) {
++        sv[warp] = bv;
++        si[warp] = bi;
++    }
++    __syncthreads();
++    if (warp != 0) return;
++    const int nw = blockDim.x >> 5;
++    bv = lane < nw ? sv[lane] : -INFINITY;
++    bi = lane < nw ? si[lane] : 0x7fffffff;
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++        if (better(ov, oi, bv, bi)) {
++            bv = ov;
++            bi = oi;
++        }
++    }
++    if (lane == 0) {
++        val[blockIdx.x] = bv;
++        id[blockIdx.x] = (bi == 0x7fffffff ? 0 : bi) + base;
++    }
++}
++
++// fp32 logits rows into bf16 whole rows at column col0: the first n columns rounded, the rest of `width` -inf.
++extern "C" __global__ void tf_ink2_tobf(const float* __restrict__ x, long long stride, int n, uint16_t* __restrict__ out,
++                                        long long out_stride, long long col0, int width) {
++    using namespace ink2o;
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= width) return;
++    const size_t row = blockIdx.y;
++    out[row * out_stride + col0 + i] = i < n ? tobf(x[row * stride + i]) : static_cast<uint16_t>(0xff80u);
++}
++
++// A link step's words (header and ids) written to the device buffer every rank broadcasts from.
++struct Ink2Words {
++    unsigned w[96];
++};
++
++extern "C" __global__ void tf_ink2_put_words(unsigned* __restrict__ dst, int n, const Ink2Words words) {
++    const int i = threadIdx.x;
++    if (i < n) dst[i] = words.w[i];
++}
+diff --git a/zig/src/core/profile.zig b/zig/src/core/profile.zig
+index ace744e..f9d9b27 100644
+--- a/zig/src/core/profile.zig
++++ b/zig/src/core/profile.zig
+@@ -134,7 +134,7 @@ const nemotron: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni" };
+ const slide_cuda: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "qwen3_5" };
+ const flash: []const []const u8 = &.{"qwen4_exp"};
+ /// The CUDA families whose host prompt cache the generic CUDA host builds (cuda_keep_others_test.zig checks the list).
+-pub const cuda_cache: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "glm5_next", "minimax_m3_vl", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kolibri1", "gemma4", "gemma4_unified", "spark2_5", "dory" };
++pub const cuda_cache: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "glm5_next", "minimax_m3_vl", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kolibri1", "gemma4", "gemma4_unified", "spark2_5", "dory", "inkling2" };
+ 
+ pub const entries = [_]Entry{
+     .{ .id = .TF_QWEN_REQUEST_STARTS, .families = qwen, .class = .arithmetic, .syntax = .one, .effect = "Opt into CUDA message-start prompt cuts", .evidence = "#1334; default-off; GB10 six-turn: resumed equals fresh, one reply differs from unset" },
+diff --git a/zig/src/families/inkling2/dump_main.zig b/zig/src/families/inkling2/dump_main.zig
+index c7c1269..31ddb0f 100644
+--- a/zig/src/families/inkling2/dump_main.zig
++++ b/zig/src/families/inkling2/dump_main.zig
+@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !u8 {
+     defer w.deinit();
+     std.debug.print("rank {d}/{d}: loaded {d} layers, {d:.2} GiB in {d:.1} s, vocab [{d}, {d})\n", .{ place.rank, place.world, c.layers, gib(w.bytes), secs(io, t0), w.share.vocab.lo, w.share.vocab.hi });
+     const shape: ink.forward.Shape = .{ .rows = @max(@min(chunk, longest), total), .context = std.mem.alignForward(usize, longest + 1, 64), .heads = w.share.heads.len(), .kv = w.share.kv.len() };
+-    var b = try ink.forward.Buffers.init(gpa, &driver, &w, shape);
++    var b = try ink.forward.Buffers.init(gpa, &driver, &w, shape, null);
+     defer b.deinit();
+     var st = try ink.forward.State.init(gpa, &driver, &w.config, shape, texts.len);
+     defer st.deinit();
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+new file mode 100644
+index 0000000..2126408
+--- /dev/null
++++ b/zig/src/families/inkling2/engine.zig
+@@ -0,0 +1,340 @@
++//! One TP rank's Inkling 2 engine: streams by slot, prompt chunks, decode windows (shared, graphed) and their draws.
++const std = @import("std");
++const cuda = @import("cuda");
++const cfg = @import("config.zig");
++const shard = @import("shard.zig");
++const weights = @import("weights.zig");
++const fw = @import("forward.zig");
++const ops = @import("ops.zig");
++const sampler = @import("sampler.zig");
++const kept = @import("kept.zig");
++
++/// Rows a prompt chunk holds (the prompt cache's mark grid) and a stream's window at most.
++pub const prompt_rows = 2048;
++pub const window_rows = 8;
++/// A shared decode forward's rows and streams at most.
++pub const shared_rows = 64;
++pub const max_shared = 16;
++/// Partial slots a prompt call writes at most: 2,048 rows over 8 global chunks (deeper calls take fewer rows).
++const prompt_parts = 8;
++
++/// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
++pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
++
++/// One stream's window in a shared forward: its slot, its ids (pending token, then drafts), its draws.
++pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
++
++/// A slot's request state: sampling, and its last window (rows, ids, start) for a keep shorter than the window.
++const Seq = struct {
++    sampling: ?sampler.Sampling = null,
++    rows: usize = 0, // rows of the last window still uncommitted
++    at: usize = 0, // where that window started
++    ids: [window_rows]i32 = undefined,
++};
++
++pub const Options = struct { capacity: usize };
++
++/// A graph's key: a decode call's rows, streams, attention tiles and partial stride (its global chunks).
++const Key = struct { n: u32, ni: u32, nt: u32, stride: u32 };
++
++pub const Engine = struct {
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    d: *const cuda.Driver,
++    c: cfg.Config,
++    m: fw.Modules,
++    stream: cuda.Stream,
++    w: weights.Weights,
++    shape_p: fw.Shape,
++    shape_d: fw.Shape,
++    bp: fw.Buffers,
++    bd: fw.Buffers,
++    parts: std.ArrayList(cuda.DeviceBuffer) = .empty, // the partials bp and bd share (one stream runs both in order)
++    st: ?fw.State = null, // every slot's caches, made by reserve
++    backup: ?cuda.DeviceBuffer = null, // each slot's conv states before a window of several rows
++    seqs: []Seq = &.{},
++    slot: u32 = 0,
++    capacity: usize,
++    exchange: fw.Exchange = .local,
++    picks: cuda.DeviceBuffer, // every rank's (value, id) of each row's greedy pick: fp32 then i32, [world][rows]
++    picks_host: []u8,
++    smp: sampler.Sampler,
++    spans: []shard.Span, // every rank's vocabulary span
++    graphs: cuda.graph_cache.Cache(Key),
++    gengine: cuda.graph_cache.CudaEngine,
++    states: kept.Store,
++    checkpoint_digest: [32]u8 = @splat(0),
++
++    pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, rank: usize, world: usize, o: Options) !*Engine {
++        const e = try gpa.create(Engine);
++        errdefer gpa.destroy(e);
++        const c = try cfg.Config.read(gpa, io, dir);
++        var stream = try cuda.Stream.init(d, false);
++        errdefer stream.deinit();
++        var m = try fw.Modules.load(d);
++        errdefer m.deinit();
++        e.* = .{ .gpa = gpa, .io = io, .d = d, .c = c, .m = m, .stream = stream, .w = undefined, .shape_p = undefined, .shape_d = undefined, .bp = undefined, .bd = undefined, .capacity = o.capacity, .picks = undefined, .picks_host = &.{}, .smp = undefined, .spans = &.{}, .graphs = undefined, .gengine = .{ .d = d }, .states = .{ .gpa = gpa } };
++        e.w = try weights.load(gpa, io, d, &e.m.dense, stream, dir, c, rank, world);
++        errdefer e.w.deinit();
++        const heads = e.w.share.heads.len();
++        const kv = e.w.share.kv.len();
++        e.shape_p = .{ .rows = prompt_rows, .context = o.capacity, .heads = heads, .kv = kv };
++        e.shape_d = .{ .rows = shared_rows, .context = o.capacity, .heads = heads, .kv = kv, .ring_rows = prompt_rows };
++        errdefer for (e.parts.items) |*b| b.free();
++        const slots = @max(prompt_rows * heads * prompt_parts, shared_rows * heads * fw.stride(&e.c, o.capacity - 1));
++        const shared = try fw.partialsFor(d, &e.parts, gpa, slots);
++        e.bp = try fw.Buffers.init(gpa, d, &e.w, e.shape_p, shared);
++        errdefer e.bp.deinit();
++        e.bd = try fw.Buffers.init(gpa, d, &e.w, e.shape_d, shared);
++        errdefer e.bd.deinit();
++        for (e.w.layers) |l| for ([_]cuda.exl3.Weight{ l.attn.q, l.attn.k, l.attn.v, l.attn.r, l.attn.gate, l.attn.o }) |x| try e.m.dense.reserve(stream, x);
++        try e.m.dense.reserve(stream, e.w.head); // scratch grown now, so nothing allocates inside a graph capture
++        e.picks = try cuda.DeviceBuffer.alloc(d, world * shared_rows * 8);
++        errdefer e.picks.free();
++        e.picks_host = try gpa.alloc(u8, world * shared_rows * 8);
++        errdefer gpa.free(e.picks_host);
++        e.smp = try sampler.Sampler.init(d, e.w.padded_vocab, shared_rows);
++        errdefer e.smp.deinit();
++        e.spans = try gpa.alloc(shard.Span, world);
++        for (e.spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&e.c, e.w.padded_vocab, q, world)).vocab;
++        e.graphs = .init(gpa, e.gengine.engine(), .{});
++        e.graphs.name = "inkling2 decode";
++        try e.stream.synchronize();
++        return e;
++    }
++
++    pub fn deinit(e: *Engine) void {
++        e.stream.synchronize() catch {};
++        e.graphs.deinit();
++        e.states.deinit();
++        if (e.st) |*s| s.deinit();
++        if (e.backup) |*b| b.free();
++        e.gpa.free(e.seqs);
++        e.gpa.free(e.spans);
++        e.smp.deinit();
++        e.gpa.free(e.picks_host);
++        e.picks.free();
++        e.bd.deinit();
++        e.bp.deinit();
++        for (e.parts.items) |*b| b.free();
++        e.parts.deinit(e.gpa);
++        e.w.deinit();
++        e.m.deinit();
++        e.stream.deinit();
++        const gpa = e.gpa;
++        gpa.destroy(e);
++    }
++
++    /// Bytes one more stream takes on this rank: its slot's rings and conv states, and their backup.
++    pub fn seqBytes(e: *const Engine) u64 {
++        return fw.slotBytes(&e.c, e.shape_d) + e.convBytes();
++    }
++
++    fn convBytes(e: *const Engine) usize {
++        return @as(usize, e.c.layers) * 2 * 3 * (e.shape_d.kv * e.c.head_dim + e.c.hidden) * 4;
++    }
++
++    /// Every slot's caches for `slots` streams, made once (the host's admission decides how many).
++    pub fn reserve(e: *Engine, slots: usize) !void {
++        if (e.st != null) return if (e.seqs.len == slots) {} else error.Inkling2Reserved;
++        e.st = try fw.State.init(e.gpa, e.d, &e.c, e.shape_d, slots);
++        errdefer {
++            e.st.?.deinit();
++            e.st = null;
++        }
++        e.backup = try cuda.DeviceBuffer.alloc(e.d, slots * e.convBytes());
++        errdefer e.backup.?.free();
++        e.seqs = try e.gpa.alloc(Seq, slots);
++        @memset(e.seqs, .{});
++    }
++
++    pub fn slotCount(e: *const Engine) usize {
++        return e.seqs.len;
++    }
++
++    pub fn bind(e: *Engine, slot: u32) !void {
++        if (slot >= e.seqs.len) return error.Inkling2NoSlot;
++        e.slot = slot;
++    }
++
++    /// The bound slot's committed length: the pending token sits there, a window's row r draws position pos + 1 + r.
++    pub fn pos(e: *const Engine) usize {
++        return e.st.?.pos[e.slot];
++    }
++
++    /// A new request on the bound slot with `sampling` (null or temperature 0: greedy).
++    pub fn begin(e: *Engine, s: ?sampler.Sampling) void {
++        e.seqs[e.slot] = .{ .sampling = sampler.check(s) };
++    }
++
++    fn forward(e: *Engine, b: *fw.Buffers, shape: fw.Shape) fw.Forward {
++        return .{ .d = e.d, .m = &e.m, .w = &e.w, .b = b, .shape = shape, .stream = e.stream, .exchange = e.exchange };
++    }
++
++    /// One chunk of the bound slot's prompt from `start` (0: a fresh pass); the first token once it ends the prompt.
++    pub fn prefillChunk(e: *Engine, ids: []const u32, start: usize) !?u32 {
++        const st = &e.st.?;
++        if (ids.len == 0 or ids.len + window_rows >= e.capacity) return error.PromptTooLong;
++        if (start >= ids.len or start % prompt_rows != 0) return error.BadChunk;
++        if (start == 0) try st.clearSlot(&e.c, e.d, e.slot, e.stream) else if (start != st.pos[e.slot]) return error.BadChunk;
++        e.states.overwrite(e.slot, start); // states on this slot past `start` lose their rows to this pass
++        const end = @min(ids.len, start + prompt_rows);
++        const f = e.forward(&e.bp, e.shape_p);
++        // a deep call writes partials for every global chunk: fewer rows a call, the same bits a row
++        const most = @max(1, e.bp.parts.slots / (e.shape_p.heads * fw.stride(&e.c, end - 1)));
++        var at = start;
++        var n: usize = 0;
++        while (at < end) : (at += n) {
++            n = @min(end - at, most);
++            const item = [_]fw.Item{.{ .slot = e.slot, .ids = @ptrCast(ids[at..][0..n]) }};
++            try f.run(st, &item);
++        }
++        if (end < ids.len) return null;
++        var t: [1]u32 = undefined;
++        try e.draw(&e.bp, n - 1, 1, ids.len, e.seqs[e.slot].sampling, &t);
++        return t[0];
++    }
++
++    /// Several streams' windows in one forward (each on its own slot), graphed when no window holds several rows.
++    pub fn verifyShared(e: *Engine, parts: []const Part) !void {
++        const st = &e.st.?;
++        if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
++        var items: [max_shared]fw.Item = undefined;
++        var ids: [shared_rows]i32 = undefined;
++        var rows: usize = 0;
++        for (parts, 0..) |p, i| {
++            if (p.ids.len == 0 or p.ids.len > window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
++            for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
++            if (p.slot >= e.seqs.len) return error.Inkling2NoSlot;
++            if (st.pos[p.slot] + p.ids.len + 1 > e.capacity) return error.ContextFull;
++            for (p.ids, 0..) |t, r| ids[rows + r] = @intCast(t);
++            items[i] = .{ .slot = p.slot, .ids = ids[rows..][0..p.ids.len] };
++            const q = &e.seqs[p.slot];
++            q.rows = p.ids.len;
++            q.at = st.pos[p.slot];
++            @memcpy(q.ids[0..p.ids.len], ids[rows..][0..p.ids.len]);
++            if (p.ids.len > 1) try e.convCopy(p.slot, true);
++            rows += p.ids.len;
++        }
++        const f = e.forward(&e.bd, e.shape_d);
++        const plan = try f.stage(st, items[0..parts.len]);
++        const Body = struct {
++            f: fw.Forward,
++            st: *const fw.State,
++            p: fw.Plan,
++            fn run(ctx: *anyopaque, _: cuda.Stream) anyerror!void {
++                const b: *@This() = @ptrCast(@alignCast(ctx));
++                try b.f.launch(b.st, b.p);
++            }
++        };
++        var body: Body = .{ .f = f, .st = st, .p = plan };
++        const key: Key = .{ .n = @intCast(plan.n), .ni = @intCast(plan.ni), .nt = @intCast(plan.nt), .stride = plan.stride };
++        const print = cuda.graph_cache.fingerprintOf(&.{ st.kc[0], e.bd.ids.ptr, e.bd.parts.o });
++        _ = try e.graphs.run(key, e.stream, print, .{ .ctx = &body, .run = Body.run });
++        fw.Forward.advance(st, items[0..parts.len]);
++        var row: usize = 0;
++        for (parts) |p| {
++            e.slot = p.slot;
++            try e.draw(&e.bd, row, p.ids.len, st.pos[p.slot] - p.ids.len + 1, e.seqs[p.slot].sampling, p.out[0..p.ids.len]);
++            row += p.ids.len;
++        }
++    }
++
++    /// The bound slot's last window keeps its first `n` rows: past them its conv states and length go back.
++    pub fn keep(e: *Engine, n: usize) !void {
++        const st = &e.st.?;
++        const q = &e.seqs[e.slot];
++        if (n == 0 or n > q.rows) return error.BadKeep;
++        if (n < q.rows) {
++            // the window's conv states ran over every row: restore them and run the kept rows again (same bits)
++            try e.convCopy(e.slot, false);
++            st.pos[e.slot] = q.at;
++            const item = [_]fw.Item{.{ .slot = e.slot, .ids = q.ids[0..n] }};
++            try e.forward(&e.bd, e.shape_d).run(st, &item);
++        }
++        q.rows = 0;
++    }
++
++    /// The slot's conv states to (out) or from its backup.
++    fn convCopy(e: *Engine, slot: usize, out: bool) !void {
++        const st = &e.st.?;
++        var off: usize = slot * e.convBytes();
++        for (st.conv) |cv| for (cv, 0..) |base, j| {
++            const n = 3 * (if (j < 2) st.kv * e.c.head_dim else @as(usize, e.c.hidden)) * 4;
++            const src = base + slot * n;
++            try e.copy(if (out) e.backup.?.ptr + off else src, if (out) src else e.backup.?.ptr + off, n);
++            off += n;
++        };
++    }
++
++    fn copy(e: *const Engine, dst: u64, src: u64, bytes: usize) !void {
++        try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.stream.handle), "cuMemcpyDtoDAsync");
++    }
++
++    /// Rows of this rank's logits (from row `row0` of `b`) to tokens at first, first + 1, ...: sampled or greedy.
++    fn draw(e: *Engine, b: *fw.Buffers, row0: usize, rows: usize, first: u64, sm: ?sampler.Sampling, out: []u32) !void {
++        const sh = e.w.share;
++        const n = sh.vocab.len();
++        const real = @min(n, @as(usize, e.c.real_vocab) -| sh.vocab.lo);
++        const logits = b.logits.ptr + row0 * n * 4;
++        if (sm) |s| {
++            try ops.tobf(&e.m.ops, e.stream, logits, rows, n, real, e.smp.full.ptr, e.smp.vocab, sh.vocab.lo, n);
++            try e.smp.draw(e.stream, e.exchange, e.spans, rows, first, sampler.rule(s), out);
++            return e.gathered();
++        }
++        const vals = e.picks.ptr + sh.rank * rows * 8;
++        try ops.top1(&e.m.ops, e.stream, logits, rows, n, real, sh.vocab.lo, vals, vals + rows * 4);
++        switch (e.exchange) {
++            .local => {},
++            .nccl => |x| if (x.group) |g| try g.allGather(e.stream, vals, e.picks.ptr, rows * 8) else try x.lib.check(x.lib.api.ncclAllGather(vals, e.picks.ptr, rows * 8, .u8, x.comm, e.stream.handle), "ncclAllGather"),
++        }
++        try e.stream.synchronize();
++        try e.gathered();
++        const bytes = e.picks_host[0 .. sh.world * rows * 8];
++        try e.picks.download(0, bytes);
++        for (0..rows) |r| {
++            var best: f32 = -std.math.inf(f32);
++            var id: u32 = 0;
++            for (0..sh.world) |q| {
++                const at = q * rows * 8;
++                const v: f32 = @bitCast(std.mem.readInt(u32, bytes[at + r * 4 ..][0..4], .little));
++                const i = std.mem.readInt(u32, bytes[at + rows * 4 + r * 4 ..][0..4], .little);
++                if (v > best or (v == best and i < id)) {
++                    best = v;
++                    id = i;
++                }
++            }
++            out[r] = id;
++        }
++    }
++
++    /// After a synchronize: a RoCE gather that failed since the last one (its rows hold nothing valid) is an error.
++    fn gathered(e: *const Engine) !void {
++        switch (e.exchange) {
++            .local => {},
++            .nccl => |x| if (x.group) |g| try g.check(),
++        }
++    }
++
++    /// Bytes a kept state takes on this rank: the slot's sliding rings and conv states (global rows stay in place).
++    pub fn stateBytes(e: *const Engine) u64 {
++        return kept.bytes(&e.c, &e.st.?, e.convBytes());
++    }
++
++    /// The bound slot's state at its length kept under `id` (every rank keeps the same id).
++    pub fn keepAs(e: *Engine, id: u64, at: usize) !void {
++        if (at == 0 or at != e.pos()) return error.BadKeep;
++        try e.states.save(e.d, e.stream, &e.c, &e.st.?, e.slot, id, at, e.convBytes());
++    }
++
++    /// The bound slot restored to state `id` (it must be the state's slot, still holding its rows).
++    pub fn restoreState(e: *Engine, id: u64) !void {
++        try e.states.restore(e.d, e.stream, &e.c, &e.st.?, e.slot, id);
++        e.seqs[e.slot].rows = 0;
++    }
++
++    pub fn dropState(e: *Engine, id: u64) void {
++        e.stream.synchronize() catch {};
++        e.states.drop(id);
++    }
++};
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+new file mode 100644
+index 0000000..ff6f1d9
+--- /dev/null
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -0,0 +1,161 @@
++//! tf-inkling2-engine: the serving engine's checks on one or two ranks (both run the same loop, no plan words).
++const std = @import("std");
++const cuda = @import("cuda");
++const ink = @import("inkling2");
++
++const usage = "usage: tf-inkling2-engine graphs|greedy <model dir> <ids.json> <out dir> [context] [new tokens]\n" ++
++    "  graphs: decode windows eager in some slots and graphed in others on the same rows; logits must match bit for bit\n" ++
++    "  greedy: each text's prompt pass then greedy decode rows, eager (writes greedy.json: name -> tokens)\n" ++
++    "  two ranks: TF_INKLING2_RANK, TF_INKLING2_WORLD and NCCL_COMM_ID on both\n";
++
++const Text = struct { name: []const u8, ids: []u32 };
++
++pub fn main(init: std.process.Init) !u8 {
++    const a = init.arena.allocator();
++    const gpa = init.gpa;
++    const io = init.io;
++    const args = try init.minimal.args.toSlice(a);
++    if (args.len < 5) {
++        std.debug.print("{s}", .{usage});
++        return 2;
++    }
++    const graphs = std.mem.eql(u8, args[1], "graphs");
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, args[3], a, .limited(1 << 26));
++    var doc = try std.json.parseFromSlice(std.json.Value, a, text, .{});
++    defer doc.deinit();
++    var list: std.ArrayList(Text) = .empty;
++    var it = doc.value.object.iterator();
++    while (it.next()) |e| {
++        const v = e.value_ptr.array.items;
++        const ids = try a.alloc(u32, v.len);
++        for (v, ids) |x, *id| id.* = @intCast(x.integer);
++        try list.append(a, .{ .name = e.key_ptr.*, .ids = ids });
++    }
++    const context = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 32768;
++    const new = if (args.len > 6) try std.fmt.parseInt(usize, args[6], 10) else 64;
++
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    if (try ctx.capability() != 121) return error.Inkling2RequiresSm121;
++    const place = try ink.admit.place();
++    var group: ?cuda.tp_group.Group = null;
++    defer if (group) |*g| g.close(); // after the engine (its graphs hold the comm's kernels), as the server closes
++    const e = try ink.engine.Engine.init(gpa, io, &driver, args[2], place.rank, place.world, .{ .capacity = ink.native.capacity(context) });
++    defer e.deinit();
++    if (place.world > 1) {
++        group = try cuda.tp_group.Group.open(&driver, place.rank, place.world);
++        try group.?.openRoce(gpa, io, &driver, e.stream, 4096 << 10);
++        e.exchange = .{ .nccl = .{ .lib = &group.?.lib, .comm = group.?.comm, .group = &group.? } };
++    }
++    try e.reserve(16);
++    try std.Io.Dir.cwd().createDirPath(io, args[4]);
++    var out = try std.Io.Dir.cwd().openDir(io, args[4], .{});
++    defer out.close(io);
++    const r0 = place.rank == 0;
++    if (!graphs) {
++        e.graphs.settings.on = false;
++        var json: std.ArrayList(u8) = .empty;
++        try json.appendSlice(a, "{");
++        for (list.items, 0..) |t, i| {
++            const toks = try greedy(e, a, t.ids, new);
++            try json.print(a, "{s}\"{s}\": [", .{ if (i > 0) ", " else "", t.name });
++            for (toks, 0..) |x, j| try json.print(a, "{s}{d}", .{ if (j > 0) ", " else "", x });
++            try json.appendSlice(a, "]");
++            if (r0) std.debug.print("{s}: {d} prompt tokens, {d} greedy tokens\n", .{ t.name, t.ids.len, toks.len });
++        }
++        try json.appendSlice(a, "}\n");
++        if (r0) try out.writeFile(io, .{ .sub_path = "greedy.json", .data = json.items });
++        return 0;
++    }
++    // cases: k streams of `rows` rows each, `steps` windows; a text of 16,380+ tokens also crosses a global chunk
++    const Case = struct { k: usize, rows: usize, steps: usize, at: usize };
++    var cases: std.ArrayList(Case) = .empty;
++    for ([_]usize{ 1, 2, 3, 4, 8 }) |k| try cases.append(a, .{ .k = k, .rows = 1, .steps = 6, .at = 0 });
++    try cases.append(a, .{ .k = 1, .rows = 4, .steps = 3, .at = 0 });
++    try cases.append(a, .{ .k = 2, .rows = 4, .steps = 3, .at = 0 });
++    for (list.items) |t| if (t.ids.len >= 16390) {
++        try cases.append(a, .{ .k = 1, .rows = 1, .steps = 8, .at = 16380 });
++        try cases.append(a, .{ .k = 2, .rows = 1, .steps = 8, .at = 16380 });
++        break;
++    };
++    var pass: usize = 0;
++    var total: usize = 0;
++    for (cases.items) |cs| {
++        const diff = try graphCase(e, a, list.items, cs.k, cs.rows, cs.steps, cs.at);
++        total += cs.steps;
++        pass += cs.steps - diff;
++        if (r0) std.debug.print("case {d} streams x {d} rows from {s}: {d}/{d} windows equal\n", .{ cs.k, cs.rows, if (cs.at > 0) "16380" else "prompt end", cs.steps - diff, cs.steps });
++    }
++    const st = e.graphs.stats;
++    if (r0) std.debug.print("graphs: {d}/{d} windows bit-identical; captured {d}, replayed {d}, eager {d}\n", .{ pass, total, st.captured, st.replayed, st.eager });
++    return if (pass == total) 0 else 1;
++}
++
++/// A text's prompt pass on the bound slot then `n` greedy tokens, one decode row at a time.
++fn greedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize) ![]u32 {
++    try e.bind(0);
++    e.begin(null);
++    var at: usize = 0;
++    var tok: u32 = while (true) : (at += ink.engine.prompt_rows) {
++        if (try e.prefillChunk(ids, at)) |t| break t;
++    };
++    const toks = try a.alloc(u32, n);
++    for (toks) |*x| {
++        x.* = tok;
++        var o: [1]u32 = undefined;
++        try e.verifyShared(&.{.{ .slot = 0, .ids = &.{tok}, .out = &o }});
++        try e.keep(1);
++        tok = o[0];
++    }
++    return toks;
++}
++
++/// One case: the same streams in slots 0..k (eager) and k..2k (graphed); returns the windows whose logits differ.
++fn graphCase(e: *ink.engine.Engine, a: std.mem.Allocator, texts: []const Text, k: usize, rows: usize, steps: usize, at: usize) !usize {
++    var pend: [8]u32 = undefined;
++    var src: [8][]const u32 = undefined;
++    var long: ?[]const u32 = null;
++    for (texts) |t| if (t.ids.len >= 16390) {
++        long = t.ids;
++    };
++    for (0..k) |i| {
++        src[i] = if (at > 0) long.?[0..at] else texts[i % texts.len].ids;
++        for ([_]usize{ i, k + i }) |slot| {
++            try e.bind(@intCast(slot));
++            e.begin(null);
++            var p: usize = 0;
++            pend[i] = while (true) : (p += ink.engine.prompt_rows) {
++                if (try e.prefillChunk(src[i], p)) |t| break t;
++            };
++        }
++    }
++    const nv = e.w.share.vocab.len();
++    var diff: usize = 0;
++    for (0..steps) |step| {
++        var ids: [8][8]u32 = undefined;
++        var outs: [2][8][8]u32 = undefined;
++        var logits: [2][]u8 = undefined;
++        for (0..k) |i| {
++            ids[i][0] = pend[i];
++            for (1..rows) |r| ids[i][r] = src[i][(step * rows + r) % src[i].len]; // fixed rows after the pending one
++        }
++        for (0..2) |arm| {
++            var parts: [8]ink.engine.Part = undefined;
++            for (0..k) |i| parts[i] = .{ .slot = @intCast(arm * k + i), .ids = ids[i][0..rows], .out = outs[arm][i][0..rows] };
++            e.graphs.settings.on = arm == 1;
++            try e.verifyShared(parts[0..k]);
++            try e.stream.synchronize();
++            logits[arm] = try a.alloc(u8, k * rows * nv * 4);
++            try e.bd.logits.download(0, logits[arm]);
++            for (0..k) |i| {
++                try e.bind(@intCast(arm * k + i));
++                try e.keep(rows);
++            }
++        }
++        if (!std.mem.eql(u8, logits[0], logits[1])) diff += 1;
++        for (0..k) |i| pend[i] = outs[0][i][rows - 1];
++    }
++    return diff;
++}
+diff --git a/zig/src/families/inkling2/follow.zig b/zig/src/families/inkling2/follow.zig
+new file mode 100644
+index 0000000..cc2b3dd
+--- /dev/null
++++ b/zig/src/families/inkling2/follow.zig
+@@ -0,0 +1,282 @@
++//! TP over processes: rank 0's Leader sends each step (a header, then ids) by NCCL first; the other ranks `follow`.
++const std = @import("std");
++const cuda = @import("cuda");
++const engine = @import("engine.zig");
++const ops = @import("ops.zig");
++const sampler = @import("sampler.zig");
++const Engine = engine.Engine;
++
++pub const Kind = enum(u32) { begin = 1, chunk, shared, keep, release, idle, end, save, drop, reserve };
++
++/// One step as it crosses: 64 bytes, then `n` u32 ids. NCCL waits as long as it takes, so a follower idles safely.
++pub const Header = extern struct {
++    kind: u32,
++    n: u32 = 0, // ids that follow
++    depth: u32 = 0, // shared: its parts; chunk: where it starts
++    flags: u32 = 0, // begin: 1 sampled
++    a: u64 = 0, // keep: rows; chunk: the prompt's length; save: the state's id; reserve: slots
++    seed: u64 = 0, // chunk: a kept state's id to resume from (0: none); save: its position
++    temperature: f64 = 0,
++    top_p: f64 = 0,
++    min_p: f64 = 0,
++    top_k: u32 = 0,
++    slot: u32 = 0, // the stream's slot the step runs on
++
++    comptime {
++        std.debug.assert(@sizeOf(Header) == 64);
++    }
++};
++
++pub const put_ids = 96 - 16;
++
++pub const Link = struct {
++    lib: *const cuda.nccl.Library,
++    comm: cuda.nccl.Comm,
++    stream: cuda.Stream,
++    buf: cuda.DeviceBuffer, // header, then ids
++    ids: []u32, // host copy of the last step's ids
++    gpa: std.mem.Allocator,
++    asleep: bool = false, // rank 0: the other ranks sleep on their lines (cuda.tp_watch) until its next step
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, max_ids: usize) !Link {
++        var buf = try cuda.DeviceBuffer.alloc(d, 64 + max_ids * 4);
++        errdefer buf.free();
++        return .{ .lib = lib, .comm = comm, .stream = stream, .buf = buf, .ids = try gpa.alloc(u32, max_ids), .gpa = gpa };
++    }
++
++    pub fn deinit(l: *Link) void {
++        l.gpa.free(l.ids);
++        l.buf.free();
++    }
++
++    fn post(l: *Link, bytes: usize) !void {
++        try l.lib.check(l.lib.api.ncclBroadcast(l.buf.ptr, l.buf.ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
++    }
++
++    /// Rank 0: the step, then its ids, to every rank in two broadcasts; up to `put_ids` ids by a kernel, unwaited.
++    pub fn send(l: *Link, k: *const ops.Kernels, h: Header, ids: []const u32) !void {
++        if (ids.len > l.ids.len) return error.TooManyIds;
++        var hh = h;
++        hh.n = @intCast(ids.len);
++        if (ids.len <= put_ids) {
++            var w: ops.Words = undefined;
++            @memcpy(w.w[0..16], std.mem.bytesAsSlice(u32, std.mem.asBytes(&hh)));
++            @memcpy(w.w[16..][0..ids.len], ids);
++            try ops.putWords(k, l.stream, l.buf.ptr, 16 + ids.len, w);
++        } else {
++            try l.buf.uploadAsync(0, std.mem.asBytes(&hh), l.stream.handle);
++            try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
++        }
++        try l.post(64);
++        if (ids.len > 0) try l.post(64 + ids.len * 4);
++        if (ids.len > put_ids) try l.stream.synchronize(); // the host ids' upload is done before they change
++    }
++
++    /// Other ranks: the next step and its ids (valid until the next receive).
++    pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
++        try l.post(64);
++        try l.stream.synchronize();
++        var h: Header = undefined;
++        try l.buf.download(0, std.mem.asBytes(&h));
++        if (h.n > l.ids.len) return error.TooManyIds;
++        if (h.n > 0) {
++            try l.post(64 + h.n * 4);
++            try l.stream.synchronize();
++            try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
++        }
++        return .{ .h = h, .ids = l.ids[0..h.n] };
++    }
++};
++
++/// A kept prompt state: its id (the same on every rank) and the position it stands at.
++pub const Kept = struct { id: u64, at: u32 };
++
++/// Rank 0's engine: every step goes to the other ranks first.
++pub const Leader = struct {
++    e: *Engine,
++    link: ?*Link, // null: one rank
++    next_id: u64 = 1,
++    dropped: std.ArrayList(u64) = .empty, // ids dropped since the other ranks last heard
++
++    pub fn deinit(x: *Leader) void {
++        x.dropped.deinit(x.e.gpa);
++    }
++
++    fn send(x: *Leader, h: Header, ids: []const u32) !void {
++        const l = x.link orelse return;
++        if (h.kind != @backingInt(Kind.drop)) try x.flush();
++        var hh = h;
++        hh.slot = x.e.slot;
++        if (l.asleep) {
++            cuda.tp_watch.wake();
++            l.asleep = false;
++        }
++        try l.send(&x.e.m.ops, hh, ids);
++    }
++
++    /// States rank 0 dropped since the last step, so the other ranks free theirs too.
++    fn flush(x: *Leader) anyerror!void {
++        const d = &x.dropped;
++        while (d.items.len > 0) {
++            const n = @min(d.items.len, put_ids / 2);
++            var ids: [put_ids]u32 = undefined;
++            for (d.items[0..n], 0..) |id, i| ids[2 * i ..][0..2].* = .{ @truncate(id), @truncate(id >> 32) };
++            try x.send(.{ .kind = @backingInt(Kind.drop) }, ids[0 .. 2 * n]);
++            d.replaceRangeAssumeCapacity(0, n, &.{});
++        }
++    }
++
++    /// Every rank's caches for `slots` streams.
++    pub fn reserve(x: *Leader, slots: usize) !void {
++        try x.send(.{ .kind = @backingInt(Kind.reserve), .a = slots }, &.{});
++        try x.e.reserve(slots);
++    }
++
++    /// The bound slot's state at `at` kept on every rank under one new id.
++    pub fn save(x: *Leader, at: usize) !Kept {
++        const id = x.next_id;
++        x.next_id += 1; // an id is used once, even when this rank's copy then fails
++        if (at == 0 or at != x.e.pos()) return error.BadKeep;
++        try x.send(.{ .kind = @backingInt(Kind.save), .a = id, .seed = at }, &.{});
++        x.e.keepAs(id, at) catch |err| {
++            x.drop(id);
++            return err;
++        };
++        return .{ .id = id, .at = @intCast(at) };
++    }
++
++    /// A state rank 0's store let go: freed here now, on the other ranks at the next step.
++    pub fn drop(x: *Leader, id: u64) void {
++        x.e.dropState(id);
++        if (x.link != null) x.dropped.append(x.e.gpa, id) catch {};
++    }
++
++    /// No stream is left: the other ranks sleep on their lines until the next step instead of spinning in NCCL.
++    pub fn idle(x: *Leader) !void {
++        const l = x.link orelse return;
++        if (l.asleep or !cuda.tp_watch.open()) return;
++        try x.send(.{ .kind = @backingInt(Kind.idle) }, &.{});
++        l.asleep = true;
++    }
++
++    pub fn bind(x: *Leader, slot: u32) !void {
++        try x.e.bind(slot);
++    }
++
++    pub fn release(x: *Leader, slot: u32) !void {
++        try x.e.bind(slot);
++        try x.send(.{ .kind = @backingInt(Kind.release) }, &.{});
++    }
++
++    pub fn begin(x: *Leader, s: ?sampler.Sampling) !void {
++        const c = sampler.check(s);
++        var h: Header = .{ .kind = @backingInt(Kind.begin) };
++        if (c) |v| {
++            h.flags = 1;
++            h.seed = v.seed;
++            h.temperature = v.temperature;
++            h.top_p = v.top_p;
++            h.min_p = v.min_p;
++            h.top_k = v.top_k;
++        }
++        try x.send(h, &.{});
++        x.e.begin(c);
++    }
++
++    /// A prompt chunk on every rank, kept state `from` restored first; the first token once it ends the prompt.
++    pub fn chunk(x: *Leader, ids: []const u32, start: usize, from: ?u64, cancel: ?engine.Cancel) !?u32 {
++        if (start >= ids.len) return error.BadChunk;
++        const part = ids[start..@min(ids.len, start + engine.prompt_rows)];
++        // rank 0's cancel decides before the step goes out: every rank runs a chunk it is sent
++        if (cancel) |c| if (c.check(c.ptr)) return error.Cancelled;
++        if (from) |id| {
++            const w = x.e.states.where(id) orelse return error.SnapshotStale;
++            if (w.at != start or w.slot != x.e.slot) return error.BadChunk;
++        } else if (start % engine.prompt_rows != 0 or (start != 0 and start != x.e.pos())) return error.BadChunk;
++        try x.send(.{ .kind = @backingInt(Kind.chunk), .depth = @intCast(start), .a = ids.len, .seed = from orelse 0 }, part);
++        if (from) |id| try x.e.restoreState(id);
++        return x.e.prefillChunk(ids, start);
++    }
++
++    /// Several streams' windows in one forward on every rank: parts' slots and rows, then ids.
++    pub fn verifyShared(x: *Leader, parts: []const engine.Part) !void {
++        if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
++        var buf: [2 * engine.max_shared + engine.shared_rows]u32 = undefined;
++        var n: usize = 2 * parts.len;
++        for (parts, 0..) |p, i| {
++            if (n + p.ids.len > buf.len or p.ids.len == 0 or p.ids.len > engine.window_rows) return error.WindowTooWide;
++            for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
++            buf[2 * i] = p.slot;
++            buf[2 * i + 1] = @intCast(p.ids.len);
++            @memcpy(buf[n..][0..p.ids.len], p.ids);
++            n += p.ids.len;
++        }
++        try x.send(.{ .kind = @backingInt(Kind.shared), .depth = @intCast(parts.len) }, buf[0..n]);
++        try x.e.verifyShared(parts);
++    }
++
++    pub fn keep(x: *Leader, n: usize) !void {
++        try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
++        try x.e.keep(n);
++    }
++
++    pub fn end(x: *Leader) !void {
++        try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
++    }
++};
++
++/// A rank other than 0 runs rank 0's steps until it ends (rank 0 decides cancels before it sends a step).
++pub fn follow(e: *Engine, link: *Link) !void {
++    cuda.tp_watch.sleep(e.io);
++    while (true) {
++        const step = try link.receive();
++        const h = step.h;
++        const kind: Kind = @fromBackingInt(@intCast(h.kind));
++        if (kind == .begin or kind == .chunk or kind == .keep or kind == .save) try e.bind(h.slot);
++        switch (kind) {
++            .reserve => try e.reserve(@intCast(h.a)),
++            .begin => e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
++            .chunk => {
++                // the prompt's ids past this chunk are not needed here: the chunk's own rows carry its positions
++                const ids = try e.gpa.alloc(u32, h.a);
++                defer e.gpa.free(ids);
++                @memset(ids, 0);
++                @memcpy(ids[h.depth..][0..step.ids.len], step.ids);
++                if (h.seed != 0) try e.restoreState(h.seed);
++                _ = try e.prefillChunk(ids, h.depth);
++            },
++            .shared => {
++                const k = h.depth;
++                if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
++                var parts: [engine.max_shared]engine.Part = undefined;
++                var outs: [engine.shared_rows]u32 = undefined;
++                var at: usize = 2 * k;
++                var row: usize = 0;
++                for (parts[0..k], 0..) |*p, i| {
++                    const n = step.ids[2 * i + 1];
++                    if (at + n > step.ids.len or row + n > outs.len) return error.BadStep;
++                    p.* = .{ .slot = step.ids[2 * i], .ids = step.ids[at..][0..n], .out = outs[row..][0..n] };
++                    at += n;
++                    row += n;
++                }
++                try e.verifyShared(parts[0..k]);
++            },
++            .keep => try e.keep(@intCast(h.a)),
++            .release => {},
++            .save => try e.keepAs(h.a, @intCast(h.seed)),
++            .drop => {
++                var i: usize = 0;
++                while (i + 1 < step.ids.len) : (i += 2) e.dropState(@as(u64, step.ids[i]) | @as(u64, step.ids[i + 1]) << 32);
++            },
++            .idle => cuda.tp_watch.sleep(e.io),
++            .end => return cuda.tp_watch.ended(),
++        }
++    }
++}
++
++test "a step's header is 64 bytes and keeps its fields" {
++    const h: Header = .{ .kind = @backingInt(Kind.shared), .n = 3, .depth = 2, .flags = 1, .a = 7, .seed = 1 << 62, .temperature = 0.6, .top_p = 0.95, .top_k = 20 };
++    var back: Header = undefined;
++    @memcpy(std.mem.asBytes(&back), std.mem.asBytes(&h));
++    try std.testing.expectEqual(h, back);
++}
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 65c328e..fb4c801 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -1,4 +1,4 @@
+-//! Inkling 2's decoder forward on one rank: one stream's rows (a prompt chunk or decode rows) to softcapped logits.
++//! Inkling 2's decoder forward on one rank: streams' rows (prompt chunks or decode rows) to softcapped logits.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const cfg = @import("config.zig");
+@@ -40,23 +40,36 @@ pub const Shape = struct {
+     context: usize, // most positions a stream reaches
+     heads: usize, // the rank's query heads
+     kv: usize, // the rank's key heads
++    ring_rows: usize = 0, // rows a call may write into a sliding ring (0: rows)
+ 
+-    fn sliding(s: Shape, c: *const cfg.Config) kernels.Layer {
+-        return kernels.Layer.sliding(c.window, @intCast(s.rows));
++    pub fn sliding(s: Shape, c: *const cfg.Config) kernels.Layer {
++        return kernels.Layer.sliding(c.window, @intCast(if (s.ring_rows > 0) s.ring_rows else s.rows));
+     }
+ 
+-    fn global(s: Shape) kernels.Layer {
++    pub fn global(s: Shape) kernels.Layer {
+         return kernels.Layer.global(@intCast(s.context));
+     }
+ 
+     fn layer(s: Shape, c: *const cfg.Config, i: usize) kernels.Layer {
+         return if (c.layer[i] == .sliding) s.sliding(c) else s.global();
+     }
++};
++
++/// Partials a (row, head) needs for a call whose rows reach `last_pos`: a sliding window's, or the global chunks'.
++pub fn stride(c: *const cfg.Config, last_pos: usize) u32 {
++    const sl = kernels.Layer.sliding(c.window, 1);
++    return @max(kernels.slotsFor(sl, 1), kernels.chunks(last_pos, kernels.global_chunk));
++}
+ 
+-    fn chunks(s: Shape, c: *const cfg.Config) u32 {
+-        return @max(kernels.spanMax(s.rows, s.context, s.sliding(c)), kernels.spanMax(s.rows, s.context, s.global()));
++/// Bytes of one cache slot of a stream: K and V rings a layer plus four conv states (the per-stream cost).
++pub fn slotBytes(c: *const cfg.Config, s: Shape) u64 {
++    var total: u64 = 0;
++    for (0..c.layers) |i| {
++        total += 2 * @as(u64, s.kv) * s.layer(c, i).ring * c.head_dim * 2;
++        total += 2 * 3 * @as(u64, s.kv) * c.head_dim * 4 + 2 * 3 * @as(u64, c.hidden) * 4;
+     }
+-};
++    return total;
++}
+ 
+ fn alloc(d: *const cuda.Driver, list: *std.ArrayList(Buf), gpa: std.mem.Allocator, bytes: usize) !u64 {
+     var b = try Buf.alloc(d, @max(bytes, 256));
+@@ -75,9 +88,10 @@ pub const State = struct {
+     conv: [][4]u64 = &.{}, // k, v (fp32 [slots][3][kv * 128]) and attention, MLP (fp32 [slots][3][hidden]) a layer
+     pos: []usize = &.{}, // positions each slot's caches hold
+     ring: [2]usize = .{ 0, 0 }, // sliding and global ring slots a key head
++    kv: usize = 0,
+ 
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: *const cfg.Config, s: Shape, slots: usize) !State {
+-        var st: State = .{ .gpa = gpa };
++        var st: State = .{ .gpa = gpa, .kv = s.kv };
+         errdefer st.deinit();
+         st.kc = try gpa.alloc(u64, c.layers);
+         st.vc = try gpa.alloc(u64, c.layers);
+@@ -101,6 +115,16 @@ pub const State = struct {
+         @memset(st.pos, 0);
+     }
+ 
++    /// One slot's conv states zeroed on `s` (a fresh pass; its rings are only read at positions it writes).
++    pub fn clearSlot(st: *State, c: *const cfg.Config, d: *const cuda.Driver, slot: usize, s: cuda.Stream) !void {
++        for (st.conv) |cv| for (cv, 0..) |base, j| {
++            const n = 3 * (if (j < 2) st.kv * c.head_dim else @as(usize, c.hidden)) * 4;
++            const view: Buf = .{ .d = d, .ptr = base + slot * n, .len = n, .borrowed = true };
++            try view.fill8(0, s.handle);
++        };
++        st.pos[slot] = 0;
++    }
++
+     pub fn deinit(st: *State) void {
+         for (st.bufs.items) |*b| b.free();
+         st.bufs.deinit(st.gpa);
+@@ -120,11 +144,14 @@ pub const max_items = 64;
+ /// One stream's rows in a call: its slot and the ids at its next positions.
+ pub const Item = struct { slot: usize, ids: []const i32 };
+ 
+-/// A call's scratch, sized for Shape.rows rows.
++/// Attention partials a call's rows write: `slots` (row, head, chunk) entries, fp32 sums, each chunk's max and total.
++pub const Partials = struct { o: u64, ml: u64, slots: usize };
++
++/// A call's scratch, sized for Shape.rows rows; the partials may be another Buffers' (one stream runs them in order).
+ pub const Buffers = struct {
+     gpa: std.mem.Allocator,
+     bufs: std.ArrayList(Buf) = .empty,
+-    ids: Buf = undefined, // int32 rows, then pos, seg_of, the segment and the tiles
++    ids: Buf = undefined, // int32 rows, then pos, seg_of, the segments and the tiles
+     x: u64 = 0, // bf16 [rows][hidden]: the residual stream between layers
+     resid: u64 = 0, // fp32 [rows][hidden]: the residual inside a layer
+     blocks: u64 = 0, // bf16 [8][rows][hidden]: the completed blocks' inputs of these rows
+@@ -142,8 +169,7 @@ pub const Buffers = struct {
+     qo: u64 = 0,
+     relo: u64 = 0,
+     tab: u64 = 0,
+-    part_o: u64 = 0,
+-    part_ml: u64 = 0,
++    parts: Partials = .{ .o = 0, .ml = 0, .slots = 0 },
+     att: u64 = 0,
+     ao: u64 = 0,
+     scores: u64 = 0,
+@@ -154,7 +180,8 @@ pub const Buffers = struct {
+     exs: cuda.exl3_experts.Scratch = undefined,
+     logits: Buf = undefined, // fp32 [rows][padded vocab of the rank]
+ 
+-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, s: Shape) !Buffers {
++    /// Scratch for `s.rows` rows; `shared` partials, else its own for every row at the shape's context.
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, s: Shape, shared: ?Partials) !Buffers {
+         const c = &w.config;
+         var b: Buffers = .{ .gpa = gpa };
+         errdefer b.deinit();
+@@ -166,7 +193,7 @@ pub const Buffers = struct {
+                 return alloc(dd, &bb.bufs, bb.gpa, bytes);
+             }
+         }.f;
+-        b.ids = try Buf.alloc(d, n * 12 + max_items * (2 * @sizeOf(kernels.Seg) + 16) + (kernels.tileCount(n, c.group()) + max_items) * 8 + 256);
++        b.ids = try Buf.alloc(d, stageBytes(n, max_items, kernels.tileCount(n, c.group()) + max_items));
+         b.x = try A(&b, d, n * h * 2);
+         b.resid = try A(&b, d, n * h * 4);
+         b.blocks = try A(&b, d, ops.max_blocks * n * h * 2);
+@@ -184,9 +211,10 @@ pub const Buffers = struct {
+         b.qo = try A(&b, d, n * s.heads * hd * 2);
+         b.relo = try A(&b, d, n * s.heads * c.d_rel * 2);
+         b.tab = try A(&b, d, kernels.tableBytes(n, @intCast(s.heads)));
+-        const nc = s.chunks(c);
+-        b.part_o = try A(&b, d, n * s.heads * nc * hd * 4);
+-        b.part_ml = try A(&b, d, n * s.heads * nc * 8);
++        b.parts = shared orelse blk: {
++            const slots = n * s.heads * stride(c, s.context - 1);
++            break :blk .{ .o = try A(&b, d, slots * hd * 4), .ml = try A(&b, d, slots * 8), .slots = slots };
++        };
+         b.att = try A(&b, d, n * s.heads * hd * 2);
+         b.ao = try A(&b, d, n * h * 4);
+         b.scores = try A(&b, d, n * @as(usize, c.experts) * 4);
+@@ -195,7 +223,7 @@ pub const Buffers = struct {
+         b.moe = try A(&b, d, n * h * 4);
+         if (w.share.world > 1) b.gathered = try A(&b, d, w.share.world * n * h * 4);
+         const el = w.layers[0].experts;
+-        b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try cuda.exl3_experts.scratchBytes(el, n, c.topk)), el, n, c.topk);
++        b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try cuda.exl3_experts.scratchBytes(el, @min(n, expert_rows), c.topk)), el, @min(n, expert_rows), c.topk);
+         b.logits = try Buf.alloc(d, n * w.share.vocab.len() * 4);
+         return b;
+     }
+@@ -208,15 +236,36 @@ pub const Buffers = struct {
+     }
+ };
+ 
+-/// How the ranks' partials (after o_proj and the experts) meet: one rank alone, or gathered over NCCL in rank order.
++/// Partials for `rows` rows of `heads` heads at `context`, to share between a rank's Buffers.
++pub fn partialsFor(d: *const cuda.Driver, list: *std.ArrayList(Buf), gpa: std.mem.Allocator, slots: usize) !Partials {
++    return .{ .o = try alloc(d, list, gpa, slots * kernels.head_dim * 4), .ml = try alloc(d, list, gpa, slots * 8), .slots = slots };
++}
++
++/// How the ranks' partials (after o_proj and the experts) meet: one rank alone, or gathered in rank order.
+ pub const Exchange = union(enum) {
+     local,
+-    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm },
++    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, group: ?*const cuda.tp_group.Group = null },
+ };
+ 
+ /// A conv input made of `parts` fp32 rank partials, `stride` elements apart.
+ const Parts = struct { x: u64, parts: i32, stride: i64 };
+ 
++/// Where a call's staged words sit in Buffers.ids: ids, pos, seg_of (int32 a row), then segments and tiles.
++const Layout = struct { segs: [2]usize, conv: usize, tiles: usize, end: usize };
++
++fn layout(n: usize, ni: usize, nt: usize) Layout {
++    const at0 = std.mem.alignForward(usize, n * 12, 16);
++    const seg = ni * @sizeOf(kernels.Seg);
++    return .{ .segs = .{ at0, at0 + seg }, .conv = at0 + 2 * seg, .tiles = at0 + 2 * seg + ni * 16, .end = at0 + 2 * seg + ni * 16 + nt * @sizeOf(kernels.Tile) };
++}
++
++fn stageBytes(n: usize, ni: usize, nt: usize) usize {
++    return layout(n, ni, nt).end + 256;
++}
++
++/// A staged call: its rows, streams, tiles, the latest row's position and the partials' stride.
++pub const Plan = struct { n: usize, ni: usize, nt: usize, last: usize, stride: u32 };
++
+ pub const Forward = struct {
+     d: *const cuda.Driver,
+     m: *Modules,
+@@ -232,12 +281,12 @@ pub const Forward = struct {
+         return f.b.gathered + f.w.share.rank * n * f.w.config.hidden * 4;
+     }
+ 
+-    /// Every rank's partial into every rank's gathered buffer; the conv kernels add them in rank order.
++    /// Every rank's partial into every rank's gathered buffer (RoCE writes when they fit); convs add them in order.
+     fn gather(f: Forward, n: usize) !Parts {
+         const h: usize = f.w.config.hidden;
+         switch (f.exchange) {
+             .local => return error.Inkling2NoExchange,
+-            .nccl => |x| try x.lib.check(x.lib.api.ncclAllGather(f.slot(0, n), f.b.gathered, n * h, .f32, x.comm, f.stream.handle), "ncclAllGather"),
++            .nccl => |x| if (x.group) |g| try g.allGather(f.stream, f.slot(0, n), f.b.gathered, n * h * 4) else try x.lib.check(x.lib.api.ncclAllGather(f.slot(0, n), f.b.gathered, n * h, .f32, x.comm, f.stream.handle), "ncclAllGather"),
+         }
+         return .{ .x = f.b.gathered, .parts = @intCast(f.w.share.world), .stride = @intCast(n * h) };
+     }
+@@ -254,6 +303,18 @@ pub const Forward = struct {
+ 
+     /// Each item's ids at its stream's next positions through every layer; the rows' logits land in b.logits.
+     pub fn run(f: Forward, st: *State, items: []const Item) !void {
++        const p = try f.stage(st, items);
++        try f.launch(st, p);
++        advance(st, items);
++    }
++
++    /// The items' streams stand past their rows.
++    pub fn advance(st: *State, items: []const Item) void {
++        for (items) |it| st.pos[it.slot] += it.ids.len;
++    }
++
++    /// The call's ids, positions, segments and tiles uploaded (after the stream drains); launch runs on them.
++    pub fn stage(f: Forward, st: *const State, items: []const Item) !Plan {
+         const c = &f.w.config;
+         var n: usize = 0;
+         for (items) |it| {
+@@ -261,12 +322,7 @@ pub const Forward = struct {
+             n += it.ids.len;
+         }
+         if (n == 0 or n > f.shape.rows or items.len > max_items) return error.Inkling2Rows;
+-        const h: usize = c.hidden;
+-        const s = f.stream;
+-        const k = &f.m.ops;
+-        const b = f.b;
+         const gpa = f.w.gpa;
+-        // stage: ids, positions, each row's segment, the sliding and global segments, conv segments, attention tiles
+         var host: std.ArrayList(u8) = .empty;
+         defer host.deinit(gpa);
+         for (items) |it| try host.appendSlice(gpa, std.mem.sliceAsBytes(it.ids));
+@@ -274,7 +330,6 @@ pub const Forward = struct {
+         for (items, 0..) |it, j| for (0..it.ids.len) |_| try host.appendSlice(gpa, std.mem.asBytes(&@as(i32, @intCast(j))));
+         var segs: [2][max_items]kernels.Seg = undefined;
+         var cs: [max_items][4]i32 = undefined;
+-        var first: usize = std.math.maxInt(usize);
+         var last: usize = 0;
+         var row0: usize = 0;
+         const per = [2]usize{ f.shape.kv * st.ring[0] * c.head_dim, f.shape.kv * st.ring[1] * c.head_dim };
+@@ -282,38 +337,40 @@ pub const Forward = struct {
+             const p0 = st.pos[it.slot];
+             for (0..2) |r| segs[r][j] = .{ .row0 = @intCast(row0), .n = @intCast(it.ids.len), .p0 = @intCast(p0), .off = @intCast(it.slot * per[r]) };
+             cs[j] = .{ @intCast(row0), @intCast(it.ids.len), @intCast(it.slot), 0 };
+-            first = @min(first, p0);
+             last = @max(last, p0 + it.ids.len - 1);
+             row0 += it.ids.len;
+         }
+         const ni = items.len;
+-        var at: [5]usize = @splat(0);
+-        try align16(gpa, &host);
+-        at[0] = host.items.len;
++        var tl: [8192]kernels.Tile = undefined;
++        const nt = try kernels.tiles(segs[0][0..ni], c.group(), &tl);
++        const lay = layout(n, ni, nt);
++        try host.appendNTimes(gpa, 0, lay.segs[0] - host.items.len);
+         try host.appendSlice(gpa, std.mem.sliceAsBytes(segs[0][0..ni]));
+-        at[1] = host.items.len;
+         try host.appendSlice(gpa, std.mem.sliceAsBytes(segs[1][0..ni]));
+-        at[2] = host.items.len;
+         try host.appendSlice(gpa, std.mem.sliceAsBytes(cs[0..ni]));
+-        at[3] = host.items.len;
+-        var tl: [8192]kernels.Tile = undefined;
+-        const nt = try kernels.tiles(segs[0][0..ni], c.group(), &tl);
+         try host.appendSlice(gpa, std.mem.sliceAsBytes(tl[0..nt]));
+-        try s.synchronize(); // the previous call's kernels may still read the staged rows
+-        try b.ids.upload(0, host.items);
+-        const base = b.ids.ptr;
+-        const rows_of = struct {
+-            fn of(bb: u64, nn: usize, nti: usize, segs_at: usize, tiles_at: usize, heads: usize, kv: usize, fp: usize, lp: usize) kernels.Rows {
+-                return .{ .rows = @intCast(nn), .heads = @intCast(heads), .kv_heads = @intCast(kv), .pos = bb + nn * 4, .seg_of = bb + nn * 8, .segs = bb + segs_at, .tiles = bb + tiles_at, .n_tiles = @intCast(nti), .last_pos = @intCast(lp), .first_pos = @intCast(fp) };
+-            }
+-        }.of;
+-        const rows_by = [2]kernels.Rows{
+-            rows_of(base, n, nt, at[0], at[3], f.shape.heads, f.shape.kv, first, last),
+-            rows_of(base, n, nt, at[1], at[3], f.shape.heads, f.shape.kv, first, last),
+-        };
+-        const conv_segs = base + at[2];
+-        const streams = ni;
++        std.debug.assert(host.items.len == lay.end);
++        const p: Plan = .{ .n = n, .ni = ni, .nt = nt, .last = last, .stride = stride(c, last) };
++        if (n * f.shape.heads * p.stride > f.b.parts.slots) return error.Inkling2Partials;
++        try f.stream.synchronize(); // the previous call's kernels may still read the staged rows
++        try f.b.ids.upload(0, host.items);
++        return p;
++    }
+ 
++    /// A staged call's kernels only (no host work): a graph captures exactly this.
++    pub fn launch(f: Forward, st: *const State, p: Plan) !void {
++        const c = &f.w.config;
++        const n = p.n;
++        const h: usize = c.hidden;
++        const s = f.stream;
++        const k = &f.m.ops;
++        const b = f.b;
++        const base = b.ids.ptr;
++        const lay = layout(n, p.ni, p.nt);
++        var rows_by: [2]kernels.Rows = undefined;
++        for (&rows_by, lay.segs) |*r, at| r.* = .{ .rows = @intCast(n), .heads = @intCast(f.shape.heads), .kv_heads = @intCast(f.shape.kv), .pos = base + n * 4, .seg_of = base + n * 8, .segs = base + at, .tiles = base + lay.tiles, .n_tiles = @intCast(p.nt), .last_pos = @intCast(p.last) };
++        const conv_segs = base + lay.conv;
++        const streams = p.ni;
+         try ops.embed(k, s, base, n, f.w.embed, f.w.embed_norm, b.x, h, c.eps);
+         var nb: usize = 0;
+         const hd: usize = c.head_dim;
+@@ -341,12 +398,13 @@ pub const Forward = struct {
+             }
+             try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw, .segs = conv_segs, .state_stride = @intCast(3 * kvw) }, streams);
+             try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw, .segs = conv_segs, .state_stride = @intCast(3 * kvw) }, streams);
+-            const lay = f.shape.layer(c, i);
++            var lay_i = f.shape.layer(c, i);
++            lay_i.ring = @intCast(st.ring[@intFromBool(global)]); // the caches' rings, whatever rows this call's scratch holds
+             const rows = rows_by[@intFromBool(global)];
+             const prep: kernels.Prep = .{ .qk_clip = c.qk_clip, .rel_clip = c.rel_clip, .floor = c.log_floor, .alpha = c.log_alpha, .eps = c.eps };
+-            try kernels.prep(&f.m.attn, s, rows, lay, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.kc[i], st.vc[i]);
++            try kernels.prep(&f.m.attn, s, rows, lay_i, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.kc[i], st.vc[i]);
+             try kernels.relTable(&f.m.attn, s, rows, b.relo, a.rel_proj, b.tab);
+-            try kernels.attend(&f.m.attn, s, rows, lay, b.qo, st.kc[i], st.vc[i], b.tab, b.part_o, b.part_ml, b.sink, b.gate, b.att);
++            try kernels.attend(&f.m.attn, s, rows, lay_i, p.stride, b.qo, st.kc[i], st.vc[i], b.tab, b.parts.o, b.parts.ml, b.sink, b.gate, b.att);
+             try f.dense(a.o, b.att, n, f.slot(b.ao, n), .f32);
+             const ao = try f.summed(b.ao, n);
+             const boundary = i % c.block_layers == 0;
+@@ -380,16 +438,21 @@ pub const Forward = struct {
+         const nv = f.w.share.vocab.len();
+         try f.dense(f.w.head, b.normed, n, b.logits.ptr, .f32);
+         try ops.softcap(k, s, b.logits.ptr, n * nv, c.logit_softcap);
+-        for (items) |it| st.pos[it.slot] += it.ids.len;
+     }
+ };
+ 
+-/// `bytes` from `src` to `dst` on the stream (a borrowed view of the destination).
+-fn align16(gpa: std.mem.Allocator, host: *std.ArrayList(u8)) !void {
+-    try host.appendNTimes(gpa, 0, std.mem.alignForward(usize, host.items.len, 16) - host.items.len);
+-}
+-
+ fn copy(d: *const cuda.Driver, dst: u64, src: u64, bytes: usize, s: cuda.Stream) !void {
+     const view: Buf = .{ .d = d, .ptr = dst, .len = bytes, .borrowed = true };
+     try view.copyFrom(0, src, bytes, s.handle);
+ }
++
++test "forward: a staged call's words sit where launch reads them" {
++    const l = layout(3, 2, 2);
++    try std.testing.expectEqual(@as(usize, 48), l.segs[0]);
++    try std.testing.expectEqual(@as(usize, 48 + 2 * 2 * 24), l.conv); // two segment arrays (sliding, global)
++    try std.testing.expectEqual(@as(usize, 48 + 2 * 2 * 24 + 2 * 16), l.tiles);
++    try std.testing.expectEqual(@as(usize, 24), @sizeOf(kernels.Seg));
++    const c: cfg.Config = .{};
++    try std.testing.expectEqual(@as(u32, 5), stride(&c, 100));
++    try std.testing.expectEqual(@as(u32, 64), stride(&c, 1048575));
++}
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index 34e173b..ac099a7 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -1,3 +1,4 @@
++//! Inkling 2 Small (model_type inkling2) on CUDA: config, chat, reply split, admission, kernels, EXL3 weights, forward.
+ 
+ pub const config = @import("config.zig");
+ pub const chat = @import("chat.zig");
+@@ -9,6 +10,12 @@ pub const exl3 = @import("exl3.zig");
+ pub const weights = @import("weights.zig");
+ pub const experts = @import("experts.zig");
+ pub const forward = @import("forward.zig");
++pub const sampler = @import("sampler.zig");
++pub const kept = @import("kept.zig");
++pub const engine = @import("engine.zig");
++pub const follow = @import("follow.zig");
++pub const lanes = @import("lanes.zig");
++pub const native = @import("native.zig");
+ 
+ /// config.json's name in the release.
+ pub const model_type = "inkling2";
+@@ -24,4 +31,10 @@ test {
+     _ = weights;
+     _ = experts;
+     _ = forward;
++    _ = sampler;
++    _ = kept;
++    _ = engine;
++    _ = follow;
++    _ = lanes;
++    _ = native;
+ }
+diff --git a/zig/src/families/inkling2/kept.zig b/zig/src/families/inkling2/kept.zig
+new file mode 100644
+index 0000000..595eced
+--- /dev/null
++++ b/zig/src/families/inkling2/kept.zig
+@@ -0,0 +1,122 @@
++//! Kept prompt states: a slot's sliding rings and conv states copied out; its global rows stay in the slot.
++const std = @import("std");
++const cuda = @import("cuda");
++const cfg = @import("config.zig");
++const fw = @import("forward.zig");
++
++/// One kept state: the slot whose global rows it needs, where it stands, its copy (null once a pass overwrote it).
++const Snap = struct { slot: usize, at: usize, buf: ?cuda.DeviceBuffer };
++
++/// Bytes a state takes on this rank: every sliding layer's K and V ring of one slot, then its conv states.
++pub fn bytes(c: *const cfg.Config, st: *const fw.State, conv: usize) u64 {
++    var total: u64 = conv;
++    for (0..c.layers) |i| {
++        if (c.layer[i] == .sliding) total += 2 * ringBytes(c, st);
++    }
++    return total;
++}
++
++fn ringBytes(c: *const cfg.Config, st: *const fw.State) usize {
++    return st.kv * st.ring[0] * c.head_dim * 2;
++}
++
++/// States by id (the same ids on every rank); each names the slot that holds its global rows.
++pub const Store = struct {
++    gpa: std.mem.Allocator,
++    map: std.AutoHashMapUnmanaged(u64, Snap) = .empty,
++
++    pub fn deinit(s: *Store) void {
++        var it = s.map.valueIterator();
++        while (it.next()) |x| if (x.buf) |*b| b.free();
++        s.map.deinit(s.gpa);
++    }
++
++    /// The slot's state at `at` copied under `id`.
++    pub fn save(s: *Store, d: *const cuda.Driver, stream: cuda.Stream, c: *const cfg.Config, st: *const fw.State, slot: usize, id: u64, at: usize, conv: usize) !void {
++        if (s.map.contains(id)) return error.BadKeep;
++        var buf = try cuda.DeviceBuffer.alloc(d, bytes(c, st, conv));
++        errdefer buf.free();
++        try copy(d, stream, c, st, slot, buf.ptr, true);
++        try stream.synchronize();
++        try s.map.put(s.gpa, id, .{ .slot = slot, .at = at, .buf = buf });
++    }
++
++    /// State `id` back into `slot` (its own, its global rows still there): rings, conv states and length.
++    pub fn restore(s: *Store, d: *const cuda.Driver, stream: cuda.Stream, c: *const cfg.Config, st: *fw.State, slot: usize, id: u64) !void {
++        const x = s.map.get(id) orelse return error.SnapshotStale;
++        const buf = x.buf orelse return error.SnapshotStale;
++        if (x.slot != slot) return error.SnapshotElsewhere;
++        try copy(d, stream, c, st, slot, buf.ptr, false);
++        st.pos[slot] = x.at;
++    }
++
++    /// A pass on `slot` from `from` rewrites its rows past it: the states that need them go (their ids stay, stale).
++    pub fn overwrite(s: *Store, slot: usize, from: usize) void {
++        var it = s.map.valueIterator();
++        while (it.next()) |x| if (x.slot == slot and x.at > from) if (x.buf) |*b| {
++            b.free();
++            x.buf = null;
++        };
++    }
++
++    pub fn drop(s: *Store, id: u64) void {
++        const kv = s.map.fetchRemove(id) orelse return;
++        if (kv.value.buf) |b| {
++            var bb = b;
++            bb.free();
++        }
++    }
++
++    /// Whether `id` is kept and still valid.
++    pub fn holds(s: *const Store, id: u64) bool {
++        const x = s.map.get(id) orelse return false;
++        return x.buf != null;
++    }
++
++    /// The slot and position of a valid state `id`.
++    pub fn where(s: *const Store, id: u64) ?struct { slot: usize, at: usize } {
++        const x = s.map.get(id) orelse return null;
++        if (x.buf == null) return null;
++        return .{ .slot = x.slot, .at = x.at };
++    }
++
++    /// Valid states on `slot` (a fresh pass there ends them all).
++    pub fn on(s: *const Store, slot: usize) usize {
++        var n: usize = 0;
++        var it = s.map.valueIterator();
++        while (it.next()) |x| n += @intFromBool(x.slot == slot and x.buf != null);
++        return n;
++    }
++};
++
++/// The slot's rings and conv states to (out) or from `buf`, layer after layer.
++fn copy(d: *const cuda.Driver, stream: cuda.Stream, c: *const cfg.Config, st: *const fw.State, slot: usize, buf: u64, out: bool) !void {
++    const rb = ringBytes(c, st);
++    var off: u64 = 0;
++    for (0..c.layers) |i| {
++        if (c.layer[i] != .sliding) continue;
++        for ([_]u64{ st.kc[i], st.vc[i] }) |base| {
++            const src = base + slot * rb;
++            try move(d, stream, if (out) buf + off else src, if (out) src else buf + off, rb);
++            off += rb;
++        }
++    }
++    for (st.conv) |cv| for (cv, 0..) |base, j| {
++        const n = 3 * (if (j < 2) st.kv * c.head_dim else @as(usize, c.hidden)) * 4;
++        const src = base + slot * n;
++        try move(d, stream, if (out) buf + off else src, if (out) src else buf + off, n);
++        off += n;
++    };
++}
++
++fn move(d: *const cuda.Driver, stream: cuda.Stream, dst: u64, src: u64, n: usize) !void {
++    try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, n, stream.handle), "cuMemcpyDtoDAsync");
++}
++
++test "kept: a state at 1M holds 40 sliding layers' rings of a slot, not the global rows" {
++    var c: cfg.Config = .{};
++    for (0..c.layers) |i| c.layer[i] = if (i % 6 == 5) .global else .sliding;
++    const st: fw.State = .{ .gpa = std.testing.allocator, .ring = .{ 3072, 1048576 }, .kv = 4 };
++    // 40 layers x K and V x 4 key heads x 3,072 slots x 128 x 2 B = 240 MiB, plus the conv states
++    try std.testing.expectEqual(@as(u64, 240 << 20) + 7, bytes(&c, &st, 7));
++}
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 6ad2420..7e6dc69 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -61,19 +61,6 @@ pub fn chunks(last_pos: usize, chunk: u32) u32 {
+     return @intCast(last_pos / chunk + 1);
+ }
+ 
+-/// The chunks a call's rows at first..last read: from the earliest row's first key (window-relative partials).
+-pub fn span(first_pos: usize, last_pos: usize, l: Layer) struct { c0: u32, n: u32 } {
+-    const lo = if (l.window > 0) (first_pos + 1) -| l.window else 0;
+-    const c0: u32 = @intCast(lo / l.chunk);
+-    return .{ .c0 = c0, .n = chunks(last_pos, l.chunk) - c0 };
+-}
+-
+-/// Most chunks one call of up to `rows` rows reads on a layer whose positions stay below `context`.
+-pub fn spanMax(rows: usize, context: usize, l: Layer) u32 {
+-    if (l.window == 0) return chunks(context - 1, l.chunk);
+-    return @intCast(@min(chunks(context - 1, l.chunk), (rows + l.window - 2) / l.chunk + 2));
+-}
+-
+ /// Scratch bytes of a call: the bias table (bf16) and the partials (fp32 sums plus each chunk's max and total).
+ pub fn tableBytes(rows: usize, heads: u32) usize {
+     return rows * heads * extent * 2;
+@@ -122,8 +109,7 @@ pub const Rows = struct {
+     segs: u64,
+     tiles: u64,
+     n_tiles: u32,
+-    last_pos: u32,
+-    first_pos: u32, // the call's earliest row position (its chunk base)
++    last_pos: u32, // the call's latest row position (a global layer's chunks run to it)
+ };
+ 
+ fn int(x: anytype) c_int {
+@@ -155,21 +141,33 @@ pub fn relTable(k: *const Kernels, s: cuda.Stream, r: Rows, rel: u64, proj: u64,
+     try go(k.rel_table, s, .{ .x = r.rows * r.heads }, 256, &a);
+ }
+ 
+-/// Attention over the layer's cache into chunk partials, then the ordered merge with the sink and the gate.
+-pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, q: u64, kc: u64, vc: u64, tab: u64, part_o: u64, part_ml: u64, sink: u64, gate: u64, out: u64) !void {
+-    const sp = span(r.first_pos, r.last_pos, l);
+-    const n = sp.n;
++/// Attention into chunk partials (`stride` a row and head), then the ordered merge with the sink and the gate.
++pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32, q: u64, kc: u64, vc: u64, tab: u64, part_o: u64, part_ml: u64, sink: u64, gate: u64, out: u64) !void {
++    // global layers launch `stride` chunks (chunks past the rows return at once), so a graph keyed by stride replays
++    const n = if (l.window > 0) tileChunks(r.heads / r.kv_heads, l) else stride;
++    if (slotsFor(l, r.last_pos + 1) > stride) return error.Inkling2Partials;
+     var a: cuda.Args = .{};
+     for ([_]u64{ q, kc, vc, tab, r.segs, r.tiles, part_o, part_ml }) |v| a.add(v);
+-    for ([_]u32{ r.heads, r.kv_heads, l.ring, l.window, l.chunk, sp.c0, n }) |v| a.add(int(v));
++    for ([_]u32{ r.heads, r.kv_heads, l.ring, l.window, l.chunk, 0, stride }) |v| a.add(int(v));
+     a.add(@as(f32, 1.0 / @sqrt(@as(f32, head_dim))));
+     try go(k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = n }, 128, &a);
+     var b: cuda.Args = .{};
+     for ([_]u64{ part_o, part_ml, sink, gate, r.pos, out }) |v| b.add(v);
+-    for ([_]u32{ r.heads, l.window, l.chunk, sp.c0, n }) |v| b.add(int(v));
++    for ([_]u32{ r.heads, l.window, l.chunk, 0, stride }) |v| b.add(int(v));
+     try go(k.merge, s, .{ .x = r.rows * r.heads }, head_dim, &b);
+ }
+ 
++/// Chunks a sliding tile's keys span at most: its rows (64 pairs over `group` heads) plus the window before them.
++pub fn tileChunks(group: u32, l: Layer) u32 {
++    return (63 / group + l.window) / l.chunk + 2;
++}
++
++/// Partials a (row, head) needs on a layer for positions below `context`: a sliding row's window, every global chunk.
++pub fn slotsFor(l: Layer, context: usize) u32 {
++    if (l.window > 0) return (l.window - 1) / l.chunk + 2;
++    return chunks(context - 1, l.chunk);
++}
++
+ test {
+     _ = @import("kernels_test.zig");
+ }
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index e91f5c8..a51ba25 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -62,11 +62,12 @@ test "inkling2 kernels: one decode row at 1M launches 64 chunks for each of a ra
+     };
+     const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4) };
+     const s: cuda.Stream = .{ .d = &d, .handle = null };
+-    const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575, .first_pos = 1048575 };
++    const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
+     const l = k.Layer.global(1048576);
+     try k.prep(&kern, s, r, l, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, 0, 0);
+     try k.relTable(&kern, s, r, 0, 0, 0);
+-    try k.attend(&kern, s, r, l, 0, 0, 0, 0, 0, 0, 0, 0, 0);
++    try k.attend(&kern, s, r, l, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0);
++    try t.expectError(error.Inkling2Partials, k.attend(&kern, s, r, l, 63, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+     try t.expectEqual(@as(usize, 4), Fake.count);
+     try t.expectEqual([3]u32{ 1, 32, 1 }, Fake.grids[0]);
+     try t.expectEqual([3]u32{ 24, 1, 1 }, Fake.grids[1]);
+@@ -76,13 +77,10 @@ test "inkling2 kernels: one decode row at 1M launches 64 chunks for each of a ra
+     try t.expectEqual([4]u32{ 0, 0, 0, 0 }, Fake.shared);
+ }
+ 
+-test "inkling2 kernels: a call's partials start at its earliest row's first chunk (sliding at depth: 4 not 4096)" {
++test "inkling2 kernels: sliding partials are a row's window at any depth, a tile's launch a fixed chunk count" {
+     const sl = k.Layer.sliding(1024, 1);
+-    try t.expectEqual(@as(u32, 4092), k.span(1048575, 1048575, sl).c0);
+-    try t.expectEqual(@as(u32, 4), k.span(1048575, 1048575, sl).n);
+-    try t.expectEqual(@as(u32, 5), k.span(1048500, 1048500, sl).n);
+-    try t.expectEqual(@as(u32, 0), k.span(1023, 1023, sl).c0); // keys 0..1023
+-    try t.expectEqual(@as(u32, 1), k.span(1279, 1279, sl).c0); // keys 256..1279
+-    try t.expectEqual(@as(u32, 64), k.span(1048575, 1048575, k.Layer.global(1048576)).n);
+-    try t.expect(k.spanMax(2048, 1048576, k.Layer.sliding(1024, 2048)) >= k.span(900000, 902047, k.Layer.sliding(1024, 2048)).n);
++    try t.expectEqual(@as(u32, 5), k.slotsFor(sl, 1048576)); // keys pos-1023..pos touch at most 5 chunks of 256
++    try t.expectEqual(@as(u32, 6), k.tileChunks(6, sl)); // a tile's 12 rows and their windows: 6 chunks
++    try t.expectEqual(@as(u32, 64), k.slotsFor(k.Layer.global(1048576), 1048576));
++    try t.expectEqual(@as(u32, 8), k.slotsFor(k.Layer.global(131072), 131072));
+ }
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+new file mode 100644
+index 0000000..27cc753
+--- /dev/null
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -0,0 +1,265 @@
++//! Inkling 2's lane backend: a slot per stream, decode windows shared across streams in one forward, chunked prompts.
++const std = @import("std");
++const lanes = @import("lanes");
++const engine = @import("engine.zig");
++const follow = @import("follow.zig");
++
++const be = lanes.backend;
++
++/// First tokens a handle names.
++const ring = 1024;
++pub const max_rows = engine.window_rows;
++
++/// A stream's place in the backend: its slot, the rows its last window left uncommitted, its first token.
++const Lane = struct {
++    slot: u32,
++    pending_rows: ?usize = null,
++    first: ?u64 = null,
++    fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
++};
++
++pub const Lanes = struct {
++    x: follow.Leader,
++    lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
++    drawn: [ring]u32 = undefined,
++    next: u64 = 0,
++    shared: u64 = 0, // forwards that held several streams' windows
++
++    pub fn deinit(self: *Lanes) void {
++        self.lanes.deinit(self.x.e.gpa);
++        self.x.deinit();
++    }
++
++    pub fn backend(self: *Lanes) be.Backend {
++        return .{ .ptr = self, .vtable = &vt };
++    }
++
++    const vt: be.Backend.VTable = .{
++        .prefill = prefillFn,
++        .prefill_step = prefillStepFn,
++        .cancel_prefill = cancelPrefillFn,
++        .first = firstFn,
++        .queue = queueFn,
++        .read = readFn,
++        .verify = verifyFn,
++        .keep = keepFn,
++        .draft = draftFn,
++        .release = releaseFn,
++    };
++
++    /// Round facts: no drafter or copies yet (one row a stream), several streams' rows in one shared forward.
++    pub fn facts(_: *const Lanes) lanes.Model {
++        return .{
++            .copy_drafts = false,
++            .exact_width = max_rows,
++            .gpu_tokens = false,
++            .drafts = 0,
++            .hidden_rows = true,
++            .batch_rows = engine.shared_rows,
++            .max_streams = engine.max_shared,
++        };
++    }
++
++    fn of(ptr: *anyopaque) *Lanes {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn take(self: *Lanes, token: u32) u64 {
++        const h = self.next;
++        self.drawn[h % ring] = token;
++        self.next += 1;
++        return h;
++    }
++
++    fn taken(self: *const Lanes, slot: usize) bool {
++        var it = self.lanes.valueIterator();
++        while (it.next()) |l| if (l.slot == slot) return true;
++        return false;
++    }
++
++    /// A free slot: the kept state's when it is free, else the free one holding the fewest kept states.
++    fn pick(self: *const Lanes, s: *const lanes.Stream) !u32 {
++        if (s.reuse.saved) |saved| {
++            const k: *const follow.Kept = @ptrCast(@alignCast(saved));
++            if (self.x.e.states.where(k.id)) |w| if (!self.taken(w.slot)) return @intCast(w.slot);
++        }
++        var best: ?u32 = null;
++        var held: usize = std.math.maxInt(usize);
++        for (0..self.x.e.slotCount()) |i| {
++            if (self.taken(i)) continue;
++            const n = self.x.e.states.on(i);
++            if (n < held) {
++                held = n;
++                best = @intCast(i);
++            }
++        }
++        return best orelse error.NoFreeSlot;
++    }
++
++    /// The stream's slot bound, its last window committed (`kept` rows, else all of them).
++    fn bind(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
++        const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
++        try self.x.bind(l.slot);
++        if (l.pending_rows) |rows| try self.x.keep(kept orelse rows);
++        l.pending_rows = null;
++        return l;
++    }
++
++    fn cancelled(ptr: ?*anyopaque) bool {
++        return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
++    }
++
++    /// A prompt pass begins: the stream's slot claimed and bound; where it resumes (a kept state in this slot).
++    fn opening(self: *Lanes, s: *lanes.Stream) !?follow.Kept {
++        const ids = s.prompt();
++        if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
++        if (s.images.len > 0) return error.NoVision;
++        const gop = try self.lanes.getOrPut(self.x.e.gpa, s);
++        if (!gop.found_existing) gop.value_ptr.* = .{ .slot = try self.pick(s) };
++        const l = gop.value_ptr;
++        l.pending_rows = null;
++        l.fill = null;
++        l.first = null;
++        errdefer _ = self.lanes.remove(s);
++        try self.x.bind(l.slot);
++        try self.x.begin(s.sampling);
++        s.cached = 0;
++        return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len, l.slot);
++    }
++
++    /// The stream's kept state, where its pass starts (null: none, off the grid, another slot's, or overwritten).
++    fn resumeFrom(self: *Lanes, s: *lanes.Stream, len: usize, slot: u32) ?follow.Kept {
++        const saved = s.reuse.saved orelse return null;
++        const k: *const follow.Kept = @ptrCast(@alignCast(saved));
++        const w = self.x.e.states.where(k.id);
++        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or k.at % engine.prompt_rows != 0 or w == null or w.?.slot != slot) {
++            s.reuse_failed = true;
++            s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or k.at % engine.prompt_rows != 0) error.SnapshotOutOfStep else error.SnapshotStale;
++            return null;
++        }
++        s.cached = k.at;
++        return k.*;
++    }
++
++    /// The prompt pass stands at `at` (a chunk start): the store keeps the state there when it marked it.
++    fn mark(s: *lanes.Stream, at: usize) void {
++        if (at == 0) return;
++        const hook = s.reuse.hook orelse return;
++        if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) == null) return;
++        hook.at(hook.ptr, s, @intCast(at));
++    }
++
++    fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
++        const self = of(ptr);
++        const from = try self.opening(s);
++        var at: usize = if (from) |r| r.at else 0;
++        var resume_id: ?u64 = if (from) |r| r.id else null;
++        while (true) : (at += engine.prompt_rows) {
++            if (resume_id == null) mark(s, at);
++            if (try self.x.chunk(s.prompt(), at, resume_id, .{ .ptr = s, .check = cancelled })) |first| {
++                self.lanes.getPtr(s).?.first = self.take(first);
++                return;
++            }
++            resume_id = null;
++        }
++    }
++
++    /// One chunk of the stream's prompt pass (other rounds run between); true once the first token is drawn.
++    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, _: u32) anyerror!bool {
++        const self = of(ptr);
++        const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
++        const from = if (going == null) try self.opening(s) else null;
++        const l = self.lanes.getPtr(s).?;
++        if (going != null) try self.x.bind(l.slot);
++        const at = going orelse if (from) |r| r.at else 0;
++        errdefer l.fill = null;
++        if (from == null) mark(s, at);
++        if (try self.x.chunk(s.prompt(), at, if (from) |r| r.id else null, .{ .ptr = s, .check = cancelled })) |first| {
++            l.first = self.take(first);
++            l.fill = null;
++            return true;
++        }
++        l.fill = at + engine.prompt_rows;
++        return false;
++    }
++
++    fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
++        const l = of(ptr).lanes.getPtr(s) orelse return;
++        l.fill = null;
++    }
++
++    fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
++        if (position != s.prompt_len) return error.PositionMismatch;
++        const l = of(ptr).lanes.getPtr(s) orelse return error.UnknownStream;
++        return l.first orelse error.NoFirstToken;
++    }
++
++    fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
++        _ = ptr;
++        _ = s;
++        _ = feed;
++        _ = position;
++        return error.NotPipelined;
++    }
++
++    fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
++        const self = of(ptr);
++        if (handle >= self.next or self.next - handle > ring) return error.NoSuchToken;
++        return self.drawn[handle % ring];
++    }
++
++    /// A round's windows in one forward (Engine.verifyShared), one window or several.
++    fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
++        const self = of(ptr);
++        if (windows.len > engine.max_shared) return error.WindowTooWide;
++        var parts: [engine.max_shared]engine.Part = undefined;
++        var ids: [engine.max_shared][max_rows]u32 = undefined;
++        var sampled: [engine.max_shared][max_rows]u32 = undefined;
++        var lane: [engine.max_shared]*Lane = undefined;
++        for (windows, 0..) |w, k| {
++            if (w.parents != null) return error.TreesNotBuilt;
++            if (w.held > 0) return error.NoHeldDrafts;
++            if (w.masks.len > 0) return error.Inkling2NoGrammar;
++            const l = try self.bind(w.stream, null);
++            const rows = w.rows();
++            if (rows > max_rows) return error.WindowTooWide;
++            const pos = self.x.e.pos();
++            for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
++            ids[k][0] = w.pending;
++            @memcpy(ids[k][1..][0..w.tokens.len], w.tokens);
++            parts[k] = .{ .slot = l.slot, .ids = ids[k][0..rows], .out = sampled[k][0..rows] };
++            lane[k] = l;
++        }
++        try self.x.verifyShared(parts[0..windows.len]);
++        if (windows.len > 1) self.shared += 1;
++        for (out[0..windows.len], parts[0..windows.len], lane[0..windows.len]) |*o, p, l| {
++            const rows = p.ids.len;
++            @memcpy(o.sampled[0..rows], p.out);
++            @memcpy(o.drafts[0 .. rows - 1], p.ids[1..rows]);
++            l.pending_rows = rows;
++        }
++    }
++
++    fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
++        const self = of(ptr);
++        for (windows, paths) |w, path| {
++            if (path.len == 0) return error.EmptyPath;
++            for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
++            _ = try self.bind(w.stream, path.len);
++        }
++    }
++
++    fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
++        _ = ptr;
++        _ = requests;
++        return error.NoDraftHead;
++    }
++
++    /// The stream left the rounds: its slot is free (its rows stay for the states kept there).
++    fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
++        const self = of(ptr);
++        const kv = self.lanes.fetchRemove(s) orelse return;
++        self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
++        if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
++    }
++};
+diff --git a/zig/src/families/inkling2/native.zig b/zig/src/families/inkling2/native.zig
+new file mode 100644
+index 0000000..f9ede77
+--- /dev/null
++++ b/zig/src/families/inkling2/native.zig
+@@ -0,0 +1,245 @@
++//! Inkling 2 native CUDA at TP=2 (TF_INKLING2_RANK, TF_INKLING2_WORLD, NCCL_COMM_ID): rank 0 serves, rank 1 follows.
++const std = @import("std");
++const cuda = @import("cuda");
++const lanes = @import("lanes");
++const core = @import("core");
++const cfg = @import("config.zig");
++const admission = @import("admit.zig");
++const shard = @import("shard.zig");
++const engine = @import("engine.zig");
++const follow = @import("follow.zig");
++const ink_lanes = @import("lanes.zig");
++
++pub const model_type = "inkling2";
++pub const formats: []const []const u8 = &.{"exl3"};
++/// The model's native window: no rope, so 1M is served as trained.
++pub const default_context: i64 = 1048576;
++pub const max_segments: u32 = 1;
++pub const prompt_rows: u32 = engine.prompt_rows;
++/// Kept prompt states are taken where a prompt chunk starts.
++pub const snap_grid: u32 = prompt_rows;
++pub const window_rows: u32 = engine.window_rows;
++pub const explains_open = true;
++
++/// The server's reading of this rank's room after its load (the budget streams are admitted by); null if unreadable.
++pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
++pub const Options = struct {
++    context: usize,
++    drafts: bool,
++    segments: usize = 1,
++    slide: bool = false,
++    room: ?Room = null,
++};
++/// The smallest room among the other ranks and whose it is.
++pub const Peer = struct { bytes: u64, rank: usize };
++
++pub const Loaded = struct {
++    backend: lanes.backend.Backend,
++    facts: lanes.Model,
++    rows: u32,
++    stream_bytes: usize,
++    free_streams: u32 = 0, // every slot's caches are made by `reserve`, after admission
++    ctx: *anyopaque,
++    deinit: *const fn (*anyopaque) void,
++    reserve: *const fn (*anyopaque, u32) anyerror!void,
++    peer_room: ?Peer = null,
++    target: *anyopaque, // the prompt cache keeps this rank group's states (snap_*)
++};
++
++/// The text shards' bytes (the drafter's mtp.safetensors and the vision tower are not loaded yet).
++pub fn tensorWeightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, vision: bool) !u64 {
++    _ = vision;
++    const files = try core.checkpoint.shardFiles(a, io, dir);
++    defer core.checkpoint.freeShardFiles(a, files);
++    var total: u64 = 0;
++    for (files) |f| {
++        const name = std.fs.path.basename(f);
++        if (std.mem.indexOf(u8, name, "vision") != null or std.mem.indexOf(u8, name, "mtp") != null) continue;
++        total += (try std.Io.Dir.cwd().statFile(io, f, .{})).size;
++    }
++    return total;
++}
++
++/// Bytes this rank's weights take: half the split tensors, the embedding and the routers whole.
++pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64, drafts: bool) u64 {
++    _ = drafts;
++    const p = admission.place() catch return total;
++    if (p.world == 1) return total;
++    const c = cfg.Config.read(a, io, dir) catch return total;
++    const whole = @as(u64, c.vocab) * c.hidden * 2 + @as(u64, c.layers) * (@as(u64, c.experts) * c.hidden * 2 + c.experts * 4);
++    if (total < whole) return total;
++    return (total - whole) / p.world + whole;
++}
++
++/// Positions a stream holds: `context` plus a window, in whole 64-key tiles.
++pub fn capacity(context: usize) usize {
++    return std.mem.alignForward(usize, context + engine.window_rows, 64);
++}
++
++const Owned = struct {
++    gpa: std.mem.Allocator,
++    lib: ?cuda.nccl.Library = null,
++    comm: cuda.nccl.Comm = null,
++    group: ?cuda.tp_group.Group = null, // lib and comm (owned above) with RoCE writes for two ranks' small gathers
++    e: *engine.Engine,
++    link: ?follow.Link = null,
++    lanes: ink_lanes.Lanes,
++};
++
++pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
++    _ = kernels;
++    const p = try admission.place();
++    try admission.check(ctx, p.world);
++    if (std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
++    try cuda.tp_watch.start(io, p.rank, p.world);
++    return openRank(gpa, io, ctx, dir, o, p) catch |err| {
++        cuda.tp_watch.fail(@errorName(err));
++        return err;
++    };
++}
++
++fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, o: Options, p: admission.Place) !Loaded {
++    var load_cache = core.checkpoint.cache.Load.begin(io, true);
++    defer load_cache.deinit();
++    const own = try gpa.create(Owned);
++    errdefer gpa.destroy(own);
++    own.* = .{ .gpa = gpa, .e = undefined, .lanes = undefined };
++    var lib = try cuda.nccl.Library.open();
++    errdefer lib.close();
++    var id: cuda.nccl.UniqueId = undefined;
++    if (p.rank == 0) {
++        try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
++        cuda.tp_watch.sendId(&id.internal);
++    } else id.internal = try cuda.tp_watch.takeId(io);
++    var comm: cuda.nccl.Comm = null;
++    try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
++    own.lib = lib;
++    own.comm = comm;
++    errdefer _ = own.lib.?.api.ncclCommDestroy(own.comm);
++    const cap = capacity(o.context);
++    own.e = try engine.Engine.init(gpa, io, ctx.d, dir, p.rank, p.world, .{ .capacity = cap });
++    errdefer own.e.deinit();
++    own.link = try follow.Link.init(gpa, ctx.d, &own.lib.?, own.comm, own.e.stream, @max(cap, engine.prompt_rows));
++    errdefer own.link.?.deinit();
++    // small gathers by RoCE writes on two ranks, both or neither (TF_ROCE=0: NCCL); the plan word stays on NCCL
++    own.group = .{ .lib = own.lib.?, .comm = own.comm, .rank = p.rank, .world = p.world };
++    try own.group.?.openRoce(gpa, io, ctx.d, own.e.stream, 4096 << 10);
++    errdefer if (own.group.?.fast) |f| f.deinit();
++    own.e.exchange = .{ .nccl = .{ .lib = &own.lib.?, .comm = own.comm, .group = &own.group.? } };
++    try load_cache.finishAfter(.{ io, own.e.checkpoint_digest }, cuda.tp_watch.ready);
++    // rank 0 admits by the smallest room of the ranks
++    var peer: ?Peer = null;
++    {
++        const mine: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
++        var rooms = try cuda.DeviceBuffer.alloc(ctx.d, 8 * p.world);
++        defer rooms.free();
++        try rooms.upload(p.rank * 8, std.mem.asBytes(&mine));
++        try own.lib.?.check(own.lib.?.api.ncclAllGather(rooms.ptr + p.rank * 8, rooms.ptr, 8, .u8, own.comm, own.e.stream.handle), "ncclAllGather");
++        try own.e.stream.synchronize();
++        var all: [2]u64 = undefined;
++        try rooms.download(0, std.mem.sliceAsBytes(all[0..p.world]));
++        for (all[1..p.world], 1..) |r, q| if (peer == null or r < peer.?.bytes) {
++            peer = .{ .bytes = r, .rank = q };
++        };
++    }
++    if (p.rank != 0) {
++        follow.follow(own.e, &own.link.?) catch |err| {
++            std.log.err("rank {d}: following rank 0 stopped ({s})", .{ p.rank, @errorName(err) });
++            cuda.tp_watch.fail(@errorName(err));
++            std.c._exit(1);
++        };
++        cuda.tp_watch.ended();
++        std.log.info("rank {d}: rank 0 ended; leaving", .{p.rank});
++        release(own);
++        std.process.exit(0);
++    }
++    own.link.?.asleep = cuda.tp_watch.open();
++    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link.? } };
++    return .{
++        .backend = own.lanes.backend(),
++        .facts = own.lanes.facts(),
++        .rows = ink_lanes.max_rows,
++        .stream_bytes = own.e.seqBytes(),
++        .ctx = own,
++        .deinit = close,
++        .reserve = reserveFn,
++        .peer_room = peer,
++        .target = own,
++    };
++}
++
++/// The host's admitted stream count: every rank's slots made at once.
++fn reserveFn(ptr: *anyopaque, streams: u32) anyerror!void {
++    const own: *Owned = @ptrCast(@alignCast(ptr));
++    try own.lanes.x.reserve(streams);
++}
++
++/// A state kept at `at`: its bytes on this rank (rings and conv states; the global rows stay in their slot).
++pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
++    _ = at;
++    const own: *Owned = @ptrCast(@alignCast(ptr));
++    return own.e.stateBytes();
++}
++
++/// The prompt pass stands at `at` (a mark at a chunk start): every rank copies the state there under one new id.
++pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
++    _ = owner;
++    const own: *Owned = @ptrCast(@alignCast(ptr));
++    if (own.e.pos() != at) return error.NotAtMark;
++    const k = try own.gpa.create(follow.Kept);
++    errdefer own.gpa.destroy(k);
++    k.* = try own.lanes.x.save(at);
++    return k;
++}
++
++/// A restore outside a prompt pass would leave the other rank behind: states resume inside it (Lanes.resumeFrom).
++pub fn snap_restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
++    _ = ptr;
++    _ = owner;
++    _ = saved;
++    return error.RestoredInPromptPass;
++}
++
++pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
++    const own: *Owned = @ptrCast(@alignCast(ptr));
++    const k: *follow.Kept = @ptrCast(@alignCast(saved));
++    own.lanes.x.drop(k.id);
++    own.gpa.destroy(k);
++}
++
++fn close(ptr: *anyopaque) void {
++    const own: *Owned = @ptrCast(@alignCast(ptr));
++    cuda.tp_watch.ended();
++    own.lanes.x.end() catch {};
++    own.lanes.deinit();
++    release(own);
++}
++
++fn release(own: *Owned) void {
++    if (own.link) |*l| l.deinit();
++    own.e.deinit();
++    if (own.group) |*g| if (g.fast) |f| f.deinit();
++    if (own.lib) |*lib| {
++        _ = lib.api.ncclCommDestroy(own.comm);
++        lib.close();
++    }
++    own.gpa.destroy(own);
++}
++
++/// The server's words for this family's refusals.
++pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
++    return admission.explain(err) orelse switch (err) {
++        error.NoCommId => "Inkling 2's ranks meet over NCCL: set NCCL_COMM_ID to rank 0's address:port on both hosts",
++        error.UnexpectedInkling2Tensor => "a tensor is not stored as the Inkling 2 EXL3 pack stores it (the log names it)",
++        error.NoVision => "images are not served by the Inkling 2 CUDA family yet",
++        else => null,
++    };
++}
++
++test "native: refusals explain themselves; a stream's capacity holds the context and a window in whole tiles" {
++    try std.testing.expect(explain(null, error.Inkling2RequiresSm121) != null);
++    try std.testing.expect(explain(null, error.Inkling2RequiresTwoRanks) != null);
++    try std.testing.expect(explain(null, error.NoCommId) != null);
++    try std.testing.expectEqual(@as(usize, 1048576 + 64), capacity(1048576));
++    try std.testing.expectEqual(@as(usize, 131072 + 64), capacity(131072));
++}
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index 996c15a..38074f5 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -66,6 +66,9 @@ pub const Kernels = struct {
+     gateup: cuda.Function,
+     conv: cuda.Function,
+     softcap: cuda.Function,
++    top1: cuda.Function,
++    tobf: cuda.Function,
++    put_words: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -80,6 +83,9 @@ pub const Kernels = struct {
+             .gateup = try mod.function("tf_ink2_gateup"),
+             .conv = try mod.function("tf_ink2_conv"),
+             .softcap = try mod.function("tf_ink2_softcap"),
++            .top1 = try mod.function("tf_ink2_top1"),
++            .tobf = try mod.function("tf_ink2_tobf"),
++            .put_words = try mod.function("tf_ink2_put_words"),
+         };
+     }
+ 
+@@ -155,6 +161,43 @@ pub fn softcap(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, cap: f32) !v
+     try go(k.softcap, s, .{ .x = @intCast((n + 255) / 256) }, 256, &a);
+ }
+ 
++/// Each of `rows` fp32 rows (`stride` apart): its largest value among the first `n` (lowest id on ties), id + `base`.
++pub fn top1(k: *const Kernels, s: cuda.Stream, x: u64, rows: usize, stride: usize, n: usize, base: usize, val: u64, id: u64) !void {
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(@as(i64, @intCast(stride)));
++    a.add(int(n));
++    a.add(int(base));
++    a.add(val);
++    a.add(id);
++    try go(k.top1, s, .{ .x = @intCast(rows) }, 1024, &a);
++}
++
++/// `rows` fp32 rows into bf16 rows of `out` at column `col0`: `n` columns rounded, the rest of `width` set to -inf.
++pub fn tobf(k: *const Kernels, s: cuda.Stream, x: u64, rows: usize, stride: usize, n: usize, out: u64, out_stride: usize, col0: usize, width: usize) !void {
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(@as(i64, @intCast(stride)));
++    a.add(int(n));
++    a.add(out);
++    a.add(@as(i64, @intCast(out_stride)));
++    a.add(@as(i64, @intCast(col0)));
++    a.add(int(width));
++    try go(k.tobf, s, .{ .x = @intCast((width + 255) / 256), .y = @intCast(rows) }, 256, &a);
++}
++
++/// ops.cu's Ink2Words: a link step's header and ids, passed by value.
++pub const Words = extern struct { w: [96]u32 };
++
++/// The first `n` of `words` to `dst` on the stream (no host buffer to keep alive).
++pub fn putWords(k: *const Kernels, s: cuda.Stream, dst: u64, n: usize, words: Words) !void {
++    var a: cuda.Args = .{};
++    a.add(dst);
++    a.add(int(n));
++    a.add(words);
++    try go(k.put_words, s, .{ .x = 1 }, 128, &a);
++}
++
+ test "ops: the argument structs keep ops.cu's layouts" {
+     try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
+     try std.testing.expectEqual(@as(usize, 8 * 8 + 2 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
+diff --git a/zig/src/families/inkling2/sampler.zig b/zig/src/families/inkling2/sampler.zig
+new file mode 100644
+index 0000000..7260d85
+--- /dev/null
++++ b/zig/src/families/inkling2/sampler.zig
+@@ -0,0 +1,107 @@
++//! Sampled draws on main's sample.cu: each rank's bf16 columns broadcast into whole rows, every rank draws the same.
++const std = @import("std");
++const cuda = @import("cuda");
++const lanes = @import("lanes");
++const Span = @import("shard.zig").Span;
++const Exchange = @import("forward.zig").Exchange;
++
++pub const Sampling = lanes.Sampling;
++
++/// The request's rule as the engine runs it: null (or temperature 0) decodes greedily.
++pub fn check(s: ?Sampling) ?Sampling {
++    const x = s orelse return null;
++    return if (x.temperature > 0) x else null;
++}
++
++pub const Rule = cuda.sample.Rule;
++
++pub fn rule(s: Sampling) Rule {
++    return cuda.sample.rule(s);
++}
++
++pub const Sampler = struct {
++    d: *const cuda.Driver,
++    module: cuda.Module,
++    tf_draw: cuda.Function,
++    vocab: usize, // a whole row's columns: every rank's padded span
++    rows: usize,
++    full: cuda.DeviceBuffer, // bf16 [rows][vocab]: every rank's columns in place
++    rule: cuda.DeviceBuffer,
++    meta: cuda.DeviceBuffer,
++    tok: cuda.DeviceBuffer,
++    prob: cuda.DeviceBuffer,
++
++    pub fn init(d: *const cuda.Driver, vocab: usize, rows: usize) !Sampler {
++        var m = try cuda.Module.load(d, cuda.kernels.sample);
++        errdefer m.unload();
++        const f = try m.function("tf_draw");
++        var full = try cuda.DeviceBuffer.alloc(d, rows * vocab * 2);
++        errdefer full.free();
++        var r = try cuda.DeviceBuffer.alloc(d, @sizeOf(Rule));
++        errdefer r.free();
++        var meta = try cuda.DeviceBuffer.alloc(d, 16);
++        errdefer meta.free();
++        var tok = try cuda.DeviceBuffer.alloc(d, rows * 4);
++        errdefer tok.free();
++        const prob = try cuda.DeviceBuffer.alloc(d, rows * 4);
++        return .{ .d = d, .module = m, .tf_draw = f, .vocab = vocab, .rows = rows, .full = full, .rule = r, .meta = meta, .tok = tok, .prob = prob };
++    }
++
++    pub fn deinit(s: *Sampler) void {
++        s.prob.free();
++        s.tok.free();
++        s.meta.free();
++        s.rule.free();
++        s.full.free();
++        s.module.unload();
++    }
++
++    /// `rows` rows of `full` (this rank's columns written) made whole, then drawn: tokens at first, first + 1, ...
++    pub fn draw(s: *Sampler, stream: cuda.Stream, exchange: Exchange, spans: []const Span, rows: usize, first: u64, r: Rule, out: []u32) !void {
++        std.debug.assert(rows <= s.rows and out.len >= rows and first >= 1);
++        switch (exchange) {
++            .local => {},
++            .nccl => |x| try x.lib.group(Spread{ .lib = x.lib, .comm = x.comm, .stream = stream, .full = s.full.ptr, .vocab = s.vocab, .spans = spans, .rows = rows }, Spread.post),
++        }
++        try s.rule.uploadAsync(0, std.mem.asBytes(&r), stream.handle);
++        const meta = [4]i32{ @intCast(first - 1), 0, 0, 0 }; // row r keys meta[0] + r + 1
++        try s.meta.uploadAsync(0, std.mem.asBytes(&meta), stream.handle);
++        var args: cuda.Args = .{};
++        args.add(s.full.ptr);
++        args.add(@as(u32, @intCast(s.vocab)));
++        args.add(s.rule.ptr);
++        args.add(s.meta.ptr);
++        args.add(@as(i32, 0));
++        args.add(s.tok.ptr);
++        args.add(s.prob.ptr);
++        try cuda.launch.launch(s.tf_draw, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &args);
++        try stream.synchronize();
++        try s.tok.download(0, std.mem.sliceAsBytes(out[0..rows]));
++    }
++};
++
++/// Each rank's columns of each row from that rank, in one NCCL group.
++const Spread = struct {
++    lib: *const cuda.nccl.Library,
++    comm: cuda.nccl.Comm,
++    stream: cuda.Stream,
++    full: u64,
++    vocab: usize,
++    spans: []const Span,
++    rows: usize,
++
++    fn post(t: Spread) anyerror!void {
++        for (0..t.rows) |row| for (t.spans, 0..) |span, q| {
++            const at = t.full + (row * t.vocab + span.lo) * 2;
++            try t.lib.check(t.lib.api.ncclBroadcast(at, at, span.len(), .bf16, @intCast(q), t.comm, t.stream.handle), "ncclBroadcast");
++        };
++    }
++};
++
++test "sampler: temperature 0 is greedy, a sampled rule keeps its settings" {
++    const s: Sampling = .{ .seed = 1234, .temperature = 0.5, .top_k = 20, .top_p = 0.95 };
++    const r = rule(check(s).?);
++    try std.testing.expectEqual(@as(f32, 2.0), r.inv_t);
++    try std.testing.expectEqual(@as(u32, 20), r.top_k);
++    try std.testing.expectEqual(@as(?Sampling, null), check(.{ .seed = 0, .temperature = 0 }));
++}
+diff --git a/zig/src/native/cuda_families.zig b/zig/src/native/cuda_families.zig
+index 3c39a80..c5d4304 100644
+--- a/zig/src/native/cuda_families.zig
++++ b/zig/src/native/cuda_families.zig
+@@ -13,7 +13,7 @@ const spark25 = @import("spark25");
+ const dory = @import("dory");
+ 
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-pub const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("lfm2_moe_cuda").native };
++pub const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native, @import("inkling2").native, @import("lfm2_moe_cuda").native };
+ pub const families: []const api.Family = blk: {
+     var out: [registry.len + 4]api.Family = undefined;
+     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats, .decision_formats = if (@hasDecl(F, "decision_formats")) F.decision_formats else &.{} };

@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:18:01 +1100
+Subject: [PATCH 02/45] inkling2: keep the prep kernel's comment inside 120
+ columns
+
+---
+ zig/kernels/cuda/inkling2/attention.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index c2c8fe8..59fa313 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -51,7 +51,7 @@ __device__ __forceinline__ void clip(float* x, float thr) {
+ 
+ using ink2::Seg;
+ 
+-// Per row and head: q = clip(q * q_scale) (* tau, global), rel = clip(rel * rel_scale) (* tau), k = clip(k), v = rms(v).
++// Per row and head: q = clip(q * q_scale) (* tau), rel = clip(rel * rel_scale) (* tau), k = clip(k), v = rms(v).
+ extern "C" __global__ void tf_ink2_prep(const uint16_t* __restrict__ q_raw, const uint16_t* __restrict__ k_raw,
+                                         const uint16_t* __restrict__ v_raw, const uint16_t* __restrict__ rel_raw,
+                                         const uint16_t* __restrict__ q_scale, const uint16_t* __restrict__ rel_scale,

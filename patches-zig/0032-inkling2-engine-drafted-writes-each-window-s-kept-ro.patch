@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 08:26:01 +1100
+Subject: [PATCH 32/45] inkling2: engine drafted writes each window's kept rows
+ and the plain tokens
+
+drafted.json lets a run be compared token for token with a served reply
+and priced at any depth offline: a block's first d drafts are what a
+depth-d round would have checked.
+---
+ zig/src/families/inkling2/engine_main.zig | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index 2d1fa09..1783fc8 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -65,18 +65,30 @@ pub fn main(init: std.process.Init) !u8 {
+     if (std.mem.eql(u8, args[1], "timing")) return @import("engine_timing.zig").run(e, a, io, list.items, r0);
+     if (std.mem.eql(u8, args[1], "drafted")) {
+         var bad: usize = 0;
+-        for (list.items) |t| {
++        // drafted.json: each text's plain tokens and, from the eager arm, how many rows each window kept (1-8)
++        var json: std.ArrayList(u8) = .empty;
++        try json.appendSlice(a, "{");
++        for (list.items, 0..) |t, ti| {
+             e.graphs.settings.on = false;
+             const plain = try greedy(e, a, t.ids, new + 8, null);
+             for ([_]u8{ 0, 1, 2 }) |arm| {
+                 e.graphs.settings.on = arm == 1;
+                 const d = try draftedGreedy(e, a, t.ids, new, if (arm == 2) plain else null, null);
++                if (arm == 0) {
++                    try json.print(a, "{s}\"{s}\": {{\"plain\": [", .{ if (ti > 0) ", " else "", t.name });
++                    for (plain[0..new], 0..) |x, j| try json.print(a, "{s}{d}", .{ if (j > 0) "," else "", x });
++                    try json.appendSlice(a, "], \"kept\": [");
++                    for (d.kept, 0..) |x, j| try json.print(a, "{s}{d}", .{ if (j > 0) "," else "", x });
++                    try json.appendSlice(a, "]}");
++                }
+                 const same = std.mem.eql(u32, plain[0..new], d.toks[0..new]);
+                 bad += @intFromBool(!same);
+                 const what = [_][]const u8{ "eager", "graphed", "oracle drafts" };
+                 if (r0) std.debug.print("{s} {s}: drafted == plain {s}; accepted {d}/{d} drafts in {d} windows\n", .{ t.name, what[arm], if (same) "PASS" else "FAIL", d.acc, d.drafted, d.windows });
+             }
+         }
++        try json.appendSlice(a, "}\n");
++        if (r0) try out.writeFile(io, .{ .sub_path = "drafted.json", .data = json.items });
+         return if (bad == 0) 0 else 1;
+     }
+     if (!graphs) {
+@@ -119,7 +131,7 @@ pub fn main(init: std.process.Init) !u8 {
+ }
+ 
+ /// Greedy with a 7-draft block before each 8-row window, agreeing rows kept; `oracle`: plain's tokens, one spoiled.
+-pub fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize, oracle: ?[]const u32, img: ?Img) !struct { toks: []u32, acc: usize, drafted: usize, windows: usize } {
++pub fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize, oracle: ?[]const u32, img: ?Img) !struct { toks: []u32, acc: usize, drafted: usize, windows: usize, kept: []u8 } {
+     try e.bind(0);
+     e.begin(null);
+     if (img) |im| try e.images(im.pics, im.spans);
+@@ -128,6 +140,7 @@ pub fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u
+         if (try e.prefillChunk(ids, at)) |t| break t;
+     };
+     var toks: std.ArrayList(u32) = .empty;
++    var ks: std.ArrayList(u8) = .empty;
+     var kept: u32 = 0;
+     var acc: usize = 0;
+     var windows: usize = 0;
+@@ -147,11 +160,12 @@ pub fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u
+         while (k < 8 and w[k] == o[k - 1]) k += 1;
+         try e.keep(k);
+         try toks.appendSlice(a, w[0..k]);
++        try ks.append(a, @intCast(k));
+         acc += k - 1;
+         kept = @intCast(k);
+         tok = o[k - 1];
+     }
+-    return .{ .toks = toks.items, .acc = acc, .drafted = 7 * windows, .windows = windows };
++    return .{ .toks = toks.items, .acc = acc, .drafted = 7 * windows, .windows = windows, .kept = ks.items };
+ }
+ 
+ /// A text's prompt pass on the bound slot then `n` greedy tokens, one decode row at a time.

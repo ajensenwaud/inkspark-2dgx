@@ -1,0 +1,1624 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:50:31 +1100
+Subject: [PATCH 05/45] inkling2: EXL3 loading and the decoder forward on one
+ GPU
+
+Loads an exllamav3 pack (the converter's tensor names) on main's shared EXL3 operators:
+dense projections through exl3.Dense, the 384 routed experts as one grouped
+layer, everything else as stored. Each rank's share is planned already
+(whole key heads with their query groups, 128-wide expert and vocab blocks,
+input-side cuts on rows) and exercised at one rank for now.
+
+New kernels in inkling2/ops.cu: embedding with its norm, the block
+attention-residual mix and the norm after it, row dots (sinks, dynamic conv
+taps, router), the router's top-k, the softcapped SwiGLU epilogue, static and
+dynamic short convolutions with per-stream state, and the logit softcap.
+The experts run main's grouped kernels in Experts.run's order with only the
+gate/up epilogue swapped, so the shared kernels are untouched.
+
+tf-inkling2-cuda writes every row's logits for a set of texts, once as a
+prompt pass and once as decode rows, for the exllamav3 check.
+
+A truncated pack may hold no global layer, so config no longer refuses that.
+---
+ zig/build/cuda.zig                      |   1 +
+ zig/build/cuda_kernels.zig              |   1 +
+ zig/build/inkling2.zig                  |  11 +
+ zig/kernels/cuda/inkling2/ops.cu        | 303 ++++++++++++++++++++++++
+ zig/src/cuda/kernels.zig                |   1 +
+ zig/src/families/inkling2/config.zig    |   2 +-
+ zig/src/families/inkling2/dump_main.zig |  91 +++++++
+ zig/src/families/inkling2/exl3.zig      | 216 +++++++++++++++++
+ zig/src/families/inkling2/experts.zig   |  65 +++++
+ zig/src/families/inkling2/forward.zig   | 301 +++++++++++++++++++++++
+ zig/src/families/inkling2/inkling2.zig  |  14 +-
+ zig/src/families/inkling2/ops.zig       | 158 ++++++++++++
+ zig/src/families/inkling2/shard.zig     |  67 ++++++
+ zig/src/families/inkling2/weights.zig   | 223 +++++++++++++++++
+ 14 files changed, 1452 insertions(+), 2 deletions(-)
+ create mode 100644 zig/kernels/cuda/inkling2/ops.cu
+ create mode 100644 zig/src/families/inkling2/dump_main.zig
+ create mode 100644 zig/src/families/inkling2/exl3.zig
+ create mode 100644 zig/src/families/inkling2/experts.zig
+ create mode 100644 zig/src/families/inkling2/forward.zig
+ create mode 100644 zig/src/families/inkling2/ops.zig
+ create mode 100644 zig/src/families/inkling2/shard.zig
+ create mode 100644 zig/src/families/inkling2/weights.zig
+
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index a414481..8e22621 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -109,6 +109,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
+     runner.addImport("glm_cuda", glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api));
+     @import("minimax_cuda.zig").targets(b, target, optimize, strip, cuda, mods.core, mods.lanes, runner);
++    @import("inkling2.zig").targets(b, target, optimize, strip, cuda, mods.core, runner);
+     for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
+     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+     runner.addImport("spark25", @import("spark25.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 0bf5cd7..6977b95 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -148,6 +148,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "minimax_m3", .flags = glue }, // ours: MiniMax-M3.1-Flash's glue (norms, RoPE prep, routing, DSpark, tower RoPE)
+     .{ .name = "minimax_m3_attn", .flags = glue }, // ours: MiniMax-M3.1-Flash's indexer and block-sparse attention
+     .{ .name = "inkling2_attn", .src = "inkling2/attention", .flags = &.{"-O3"} }, // ours: Inkling 2's relative-bias attention
++    .{ .name = "inkling2_ops", .src = "inkling2/ops", .flags = glue }, // ours: Inkling 2's residual mix, convs, router, SwiGLU
+     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
+     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+diff --git a/zig/build/inkling2.zig b/zig/build/inkling2.zig
+index 6de66a2..3c06dcd 100644
+--- a/zig/build/inkling2.zig
++++ b/zig/build/inkling2.zig
+@@ -9,6 +9,17 @@ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
+     return m;
+ }
+ 
++/// The family in tf-cuda-test's `runner`, and tf-inkling2-cuda (every row's logits for the exllamav3 reference).
++pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, core: *std.Build.Module, runner: *std.Build.Module) void {
++    runner.addImport("inkling2", module(b, target, optimize, cuda, core));
++    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/dump_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
++    m.addImport("cuda", cuda);
++    m.addImport("inkling2", module(b, target, optimize, cuda, core));
++    const exe = b.addExecutable(.{ .name = "tf-inkling2-cuda", .root_module = m });
++    b.installArtifact(exe);
++    b.step("tf-inkling2-cuda", "Inkling 2's CUDA forward rows for the exllamav3 reference").dependOn(&b.addInstallArtifact(exe, .{}).step);
++}
++
+ /// The family's host regressions (config, chat wiring, reply split, admission, the attention plan) in `all`.
+ pub fn hostTests(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Module, core: *std.Build.Module, all: *std.Build.Step) void {
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, core) }));
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+new file mode 100644
+index 0000000..bbb1379
+--- /dev/null
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -0,0 +1,303 @@
++// Inkling 2 glue: embedding, block attention-residual mix, row dots, router top-k, softcapped SwiGLU, short convs.
++#include <cstdint>
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include "exl3_decode.cuh"
++
++namespace ink2o {
++
++constexpr int kMaxBlocks = 8;
++constexpr int kMaxQueries = 3;
++constexpr int kConvTaps = 4;
++
++__device__ __forceinline__ float bf(uint16_t u) { return __uint_as_float(static_cast<uint32_t>(u) << 16); }
++
++__device__ __forceinline__ uint16_t tobf(float f) { return __bfloat16_as_ushort(__float2bfloat16_rn(f)); }
++
++__device__ __forceinline__ float bfr(float f) { return bf(tobf(f)); }
++
++__device__ __forceinline__ float warpSum(float v) {
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++    return v;
++}
++
++// Sums of N values over the block in a fixed order: warp shuffles, then warp 0 over the warps' partials.
++template <int N>
++__device__ __forceinline__ void blockSums(float (&v)[N], float* sh) {
++    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
++    for (int i = 0; i < N; ++i) v[i] = warpSum(v[i]);
++    __syncthreads();
++    if (lane == 0)
++        for (int i = 0; i < N; ++i) sh[i * 32 + w] = v[i];
++    __syncthreads();
++    for (int i = 0; i < N; ++i) {
++        float t = lane < nw ? sh[i * 32 + lane] : 0.0f;
++        v[i] = __shfl_sync(0xffffffffu, warpSum(t), 0);
++    }
++}
++
++}  // namespace ink2o
++
++using namespace ink2o;
++
++// Per row: the embedding row times rsqrt(mean square + eps) times the norm weight, one bf16 round (embed_norm).
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_embed(const int* __restrict__ ids, const uint16_t* __restrict__ table,
++                                                               const uint16_t* __restrict__ w, uint16_t* __restrict__ out,
++                                                               int C, float eps) {
++    __shared__ float sh[32];
++    const size_t row = blockIdx.x;
++    const uint16_t* e = table + static_cast<size_t>(ids[row]) * C;
++    float s[1] = {0.0f};
++    for (int c = threadIdx.x; c < C; c += blockDim.x) s[0] += bf(e[c]) * bf(e[c]);
++    blockSums<1>(s, sh);
++    const float r = rsqrtf(s[0] / C + eps);
++    for (int c = threadIdx.x; c < C; c += blockDim.x) out[row * C + c] = tobf(bf(w[c]) * (bf(e[c]) * r));
++}
++
++// The block attention-residual mix (Inkling2BlockAttentionResidual) and the norm after it, per row and query.
++struct MixArgs {
++    const uint16_t* blocks[kMaxBlocks];  // bf16 [rows, C] each: the completed blocks' inputs
++    const void* partial;                 // [rows, C]: bf16 when partial_bf16, else fp32
++    const float* query;                  // fp32 [nq, C]; null: no mix, the partial alone (layer 0's attention)
++    const uint16_t* norm[kMaxQueries];   // bf16 [C] per query: the RMSNorm after the mix
++    uint16_t* out;                       // bf16 [nq, rows, C]
++    int n_blocks, partial_bf16, nq, rows, C;
++    float eps;
++};
++
++extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix(const MixArgs a) {
++    __shared__ float sh[32 * (1 + kMaxQueries)];
++    __shared__ float wts[kMaxQueries][kMaxBlocks + 1];
++    __shared__ float rr[kMaxBlocks + 1];
++    const size_t row = blockIdx.x;
++    const int C = a.C, n = a.n_blocks + 1;
++    auto entry = [&](int j, int c) -> float {
++        if (j < a.n_blocks) return bf(a.blocks[j][row * C + c]);
++        return a.partial_bf16 ? bf(static_cast<const uint16_t*>(a.partial)[row * C + c])
++                              : static_cast<const float*>(a.partial)[row * C + c];
++    };
++    if (a.query) {
++        for (int j = 0; j < n; ++j) {
++            float v[1 + kMaxQueries] = {0.0f, 0.0f, 0.0f, 0.0f};
++            for (int c = threadIdx.x; c < C; c += blockDim.x) {
++                const float x = entry(j, c);
++                v[0] += x * x;
++                for (int q = 0; q < a.nq; ++q) v[1 + q] += x * a.query[static_cast<size_t>(q) * C + c];
++            }
++            blockSums<1 + kMaxQueries>(v, sh);
++            const float r = rsqrtf(v[0] / C + 1e-6f);
++            if (threadIdx.x == 0) {
++                rr[j] = r;
++                for (int q = 0; q < a.nq; ++q) wts[q][j] = v[1 + q] * r * rsqrtf(static_cast<float>(C));
++            }
++        }
++        __syncthreads();
++        if (threadIdx.x < a.nq) {
++            float* l = wts[threadIdx.x];
++            float m = -INFINITY, t = 0.0f;
++            for (int j = 0; j < n; ++j) m = fmaxf(m, l[j]);
++            for (int j = 0; j < n; ++j) t += expf(l[j] - m);
++            for (int j = 0; j < n; ++j) l[j] = expf(l[j] - m) / t;
++        }
++        __syncthreads();
++    }
++    for (int q = 0; q < a.nq; ++q) {
++        float s[1] = {0.0f};
++        for (int c = threadIdx.x; c < C; c += blockDim.x) {
++            float h = 0.0f;
++            if (a.query)
++                for (int j = 0; j < n; ++j) h += wts[q][j] * (entry(j, c) * rr[j]);
++            else
++                h = entry(a.n_blocks, c);
++            s[0] += h * h;
++        }
++        blockSums<1>(s, sh);
++        const float r = rsqrtf(s[0] / C + a.eps);
++        uint16_t* o = a.out + (static_cast<size_t>(q) * a.rows + row) * C;
++        for (int c = threadIdx.x; c < C; c += blockDim.x) {
++            float h = 0.0f;
++            if (a.query)
++                for (int j = 0; j < n; ++j) h += wts[q][j] * (entry(j, c) * rr[j]);
++            else
++                h = entry(a.n_blocks, c);
++            o[c] = tobf(bf(a.norm[q][c]) * (h * r));
++        }
++    }
++}
++
++// out[row, j] = x[row, :] . W[j, :] in fp32 (bf16 inputs), a warp an output; act 1 takes the sigmoid; bf16 or fp32 out.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2_rowdot(const uint16_t* __restrict__ x, const uint16_t* __restrict__ W,
++                                                                void* __restrict__ out, int J, int C, int out_bf16, int act) {
++    const int lane = threadIdx.x & 31, j = blockIdx.y * 8 + (threadIdx.x >> 5);
++    if (j >= J) return;
++    const size_t row = blockIdx.x;
++    const uint16_t* xr = x + row * C;
++    const uint16_t* wr = W + static_cast<size_t>(j) * C;
++    float s = 0.0f;
++    for (int c = lane; c < C; c += 32) s += bf(xr[c]) * bf(wr[c]);
++    s = warpSum(s);
++    if (lane != 0) return;
++    if (act == 1) s = 1.0f / (1.0f + expf(-s));
++    if (out_bf16)
++        static_cast<uint16_t*>(out)[row * J + j] = tobf(s);
++    else
++        static_cast<float*>(out)[row * J + j] = s;
++}
++
++// Router picks per row: top-K of score + bias (ties to the lower id), weights score / sum(scores) * scale (fp32).
++extern "C" __global__ void __launch_bounds__(512) tf_ink2_topk(const float* __restrict__ scores, const float* __restrict__ bias,
++                                                              int* __restrict__ pick, float* __restrict__ wts, int E, int K,
++                                                              float scale) {
++    __shared__ float bv[16];
++    __shared__ int bi[16];
++    __shared__ float chosen[32];
++    __shared__ int chosen_id[32];
++    const size_t row = blockIdx.x;
++    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
++    float sel[8];
++    const int per = (E + blockDim.x - 1) / blockDim.x;
++    for (int i = 0; i < per && i < 8; ++i) {
++        const int e = threadIdx.x + i * blockDim.x;
++        sel[i] = e < E ? scores[row * E + e] + bias[e] : -INFINITY;
++    }
++    for (int k = 0; k < K; ++k) {
++        float v = -INFINITY;
++        int id = 0x7fffffff;
++        for (int i = 0; i < per && i < 8; ++i) {
++            const int e = threadIdx.x + i * blockDim.x;
++            if (e < E && (sel[i] > v || (sel[i] == v && e < id))) { v = sel[i]; id = e; }
++        }
++        for (int o = 16; o > 0; o >>= 1) {
++            const float ov = __shfl_xor_sync(0xffffffffu, v, o);
++            const int oi = __shfl_xor_sync(0xffffffffu, id, o);
++            if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
++        }
++        if (lane == 0) { bv[w] = v; bi[w] = id; }
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            float m = bv[0];
++            int mi = bi[0];
++            for (int i = 1; i < nw; ++i)
++                if (bv[i] > m || (bv[i] == m && bi[i] < mi)) { m = bv[i]; mi = bi[i]; }
++            chosen_id[k] = mi;
++            chosen[k] = scores[row * E + mi];
++        }
++        __syncthreads();
++        const int got = chosen_id[k];
++        if (got % blockDim.x == static_cast<int>(threadIdx.x)) sel[got / blockDim.x] = -INFINITY;
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        float t = 0.0f;
++        for (int k = 0; k < K; ++k) t += chosen[k];
++        for (int k = 0; k < K; ++k) {
++            pick[row * K + k] = chosen_id[k];
++            wts[row * K + k] = chosen[k] / (t + 1e-20f) * scale;
++        }
++    }
++}
++
++// The shared gate/up epilogue with Inkling's softcapped SwiGLU: gcap tanh(g/gcap) sigmoid(g) ucap tanh(u/ucap).
++struct GateUpArgs {
++    const float* z;      // [(mat * sk + split) * P + p] * N + col
++    const int* pick;     // int32 [P]
++    const half* svh_g;   // fp16 [E, N]
++    const half* svh_u;   // fp16 [E, N]
++    const half* suh_d;   // fp16 [E, N]
++    half* xd;            // fp16 [P, N]
++    int p, n, sk, experts;
++    float gate_cap, up_cap;
++};
++
++extern "C" __global__ void tf_ink2_gateup(const GateUpArgs a) {
++    using namespace tf_exl3;
++    const int p = blockIdx.x, blk = blockIdx.y;
++    const int e = a.pick[p];
++    if (e < 0 || e >= a.experts) return;
++    const int lane = threadIdx.x;
++    const int n = blk * 128 + 4 * lane;
++    float gv[4], uv[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        float sg = 0.f, su = 0.f;
++        for (int s = 0; s < a.sk; ++s) {
++            sg += a.z[((size_t)(0 * a.sk + s) * a.p + p) * a.n + n + j];
++            su += a.z[((size_t)(1 * a.sk + s) * a.p + p) * a.n + n + j];
++        }
++        gv[j] = sg;
++        uv[j] = su;
++    }
++    fwht128(gv, lane);
++    fwht128(uv, lane);
++    float v[4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        const float g = gv[j] * HAD_SCALE * __half2float(a.svh_g[(size_t)e * a.n + n + j]);
++        const float u = uv[j] * HAD_SCALE * __half2float(a.svh_u[(size_t)e * a.n + n + j]);
++        const float act = a.gate_cap * tanhf(g / a.gate_cap) * (1.f / (1.f + expf(-g))) * a.up_cap * tanhf(u / a.up_cap);
++        v[j] = act * __half2float(a.suh_d[(size_t)e * a.n + n + j]);
++    }
++    fwht128(v, lane);
++    half* o = a.xd + (size_t)p * a.n + n;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
++}
++
++// Short causal conv over a stream's rows (4 taps, last 3 inputs in `state`): static [C][4] or dynamic [4][C] + dyn.
++struct ConvArgs {
++    const void* x;          // [rows, C]: fp32, or bf16 when x_bf16
++    float* state;           // fp32 [3, C], oldest first
++    const uint16_t* w;      // bf16 taps
++    const float* dyn;       // fp32 [rows, heads * 4] or null
++    const uint16_t* base;   // bf16 [rows, C] (mode 1, null: zero)
++    float* resid;           // fp32 [rows, C] (modes 1 and 2)
++    uint16_t* out;          // bf16 [rows, C] (modes 0 and 2)
++    int x_bf16, round_in, heads, C, rows, mode;  // mode 0: out = y; 1: resid = base + bf16(y); 2: out = resid + bf16(y)
++};
++
++extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv(const ConvArgs a) {
++    const int c = blockIdx.x * blockDim.x + threadIdx.x;
++    if (c >= a.C) return;
++    const int C = a.C;
++    float h0 = a.state[c], h1 = a.state[C + c], h2 = a.state[2 * C + c];
++    const int hd = a.dyn ? c / (C / a.heads) : 0;
++    for (int t = 0; t < a.rows; ++t) {
++        const size_t at = static_cast<size_t>(t) * C + c;
++        float x = a.x_bf16 ? bf(static_cast<const uint16_t*>(a.x)[at]) : static_cast<const float*>(a.x)[at];
++        if (a.round_in) x = bfr(x);
++        float y;
++        if (a.dyn) {
++            const float* d = a.dyn + (static_cast<size_t>(t) * a.heads + hd) * kConvTaps;
++            y = (bf(a.w[c]) + d[0]) * x + (bf(a.w[C + c]) + d[1]) * h2;
++            y += (bf(a.w[2 * C + c]) + d[2]) * h1;
++            y += (bf(a.w[3 * C + c]) + d[3]) * h0;
++            y = (y + x) / 3.0f;
++        } else {
++            const uint16_t* w = a.w + static_cast<size_t>(c) * kConvTaps;
++            y = bf(w[0]) * h0 + bf(w[1]) * h1;
++            y += bf(w[2]) * h2;
++            y += bf(w[3]) * x;
++            y = (y + x) / 2.2360679774997896f;
++        }
++        if (a.mode == 0) {
++            a.out[at] = tobf(y);
++        } else if (a.mode == 1) {
++            a.resid[at] = (a.base ? bf(a.base[at]) : 0.0f) + bfr(y);
++        } else {
++            a.out[at] = tobf(a.resid[at] + bfr(y));
++        }
++        h0 = h1;
++        h1 = h2;
++        h2 = x;
++    }
++    a.state[c] = h0;
++    a.state[C + c] = h1;
++    a.state[2 * C + c] = h2;
++}
++
++// The final logit softcap in place: x = tanh(x / cap) * cap.
++extern "C" __global__ void tf_ink2_softcap(float* __restrict__ x, long long n, float cap) {
++    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i < n) x[i] = tanhf(x[i] / cap) * cap;
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 04b43f7..4753d14 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -81,6 +81,7 @@ pub const glm_index: []const u8 = if (available) &Blob("fatbin_glm_index").bytes
+ pub const minimax_m3: []const u8 = if (available) &Blob("fatbin_minimax_m3").bytes else &.{};
+ pub const minimax_m3_attn: []const u8 = if (available) &Blob("fatbin_minimax_m3_attn").bytes else &.{};
+ pub const inkling2_attn: []const u8 = if (available) &Blob("fatbin_inkling2_attn").bytes else &.{};
++pub const inkling2_ops: []const u8 = if (available) &Blob("fatbin_inkling2_ops").bytes else &.{};
+ pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes else &.{};
+ pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
+ pub const glm_mm: []const u8 = if (available) &Blob("fatbin_glm_mm").bytes else &.{};
+diff --git a/zig/src/families/inkling2/config.zig b/zig/src/families/inkling2/config.zig
+index b7f915a..3ba6467 100644
+--- a/zig/src/families/inkling2/config.zig
++++ b/zig/src/families/inkling2/config.zig
+@@ -185,7 +185,7 @@ pub fn validate(c: *const Config) Error!void {
+     if (c.head_dim != 128 or c.d_rel != 16 or c.rel_extent != 1024 or c.window != 1024 or c.kv_heads == 0 or
+         c.heads % c.kv_heads != 0 or c.kv_heads % 2 != 0 or c.qk_clip <= 0 or c.rel_clip <= 0 or c.log_floor < 1 or
+         c.conv != 4 or c.block_layers == 0) return error.UnsupportedInkling2Attention;
+-    if (c.globals() == 0 or c.globals() == c.layers) return error.UnsupportedInkling2Attention;
++    if (c.globals() == c.layers) return error.UnsupportedInkling2Attention; // truncated checks may hold no global layer
+     if (c.experts == 0 or c.experts % 8 != 0 or c.topk == 0 or c.topk > 8 or c.intermediate % 128 != 0 or
+         c.hidden % 128 != 0) return error.UnsupportedInkling2Experts;
+     if (c.real_vocab == 0 or c.real_vocab > c.vocab or c.context == 0) return error.BadInkling2Config;
+diff --git a/zig/src/families/inkling2/dump_main.zig b/zig/src/families/inkling2/dump_main.zig
+new file mode 100644
+index 0000000..b0eac2a
+--- /dev/null
++++ b/zig/src/families/inkling2/dump_main.zig
+@@ -0,0 +1,91 @@
++//! tf-inkling2-cuda: every row's logits of each text on one GPU, as one prompt pass (in chunks) and as decode rows.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const ink = @import("inkling2");
++
++const usage = "usage: tf-inkling2-cuda <model dir> <ids.json> <out dir> [prompt chunk rows]\n" ++
++    "  ids.json maps text names to token ids; writes <name>.prompt.f32 and <name>.decode.f32 ([rows][real vocab])\n";
++
++pub fn main(init: std.process.Init) !u8 {
++    const a = init.arena.allocator();
++    const gpa = init.gpa;
++    const io = init.io;
++    const args = try init.minimal.args.toSlice(a);
++    if (args.len != 4 and args.len != 5) {
++        std.debug.print("{s}", .{usage});
++        return 2;
++    }
++    const text = try std.Io.Dir.cwd().readFileAlloc(io, args[2], a, .limited(1 << 26));
++    var doc = try std.json.parseFromSlice(std.json.Value, a, text, .{});
++    defer doc.deinit();
++    if (doc.value != .object) return error.BadIds;
++    var longest: usize = 0;
++    var it = doc.value.object.iterator();
++    while (it.next()) |e| longest = @max(longest, e.value_ptr.array.items.len);
++    if (longest == 0) return error.BadIds;
++    const chunk = if (args.len == 5) try std.fmt.parseInt(usize, args[4], 10) else longest;
++
++    var driver = try cuda.Driver.open();
++    defer driver.close();
++    var ctx = try cuda.Context.init(&driver, 0);
++    defer ctx.deinit();
++    if (try ctx.capability() != 121) return error.Inkling2RequiresSm121; // a one-GPU check tool: sm_121 as served
++    var stream = try cuda.Stream.init(&driver, false);
++    defer stream.deinit();
++    var m = try ink.forward.Modules.load(&driver);
++    defer m.deinit();
++    const c = try ink.config.Config.read(gpa, io, args[1]);
++    var t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++    var w = try ink.weights.load(gpa, io, &driver, &m.dense, stream, args[1], c, 0, 1);
++    defer w.deinit();
++    std.debug.print("loaded {d} layers, {d:.2} GiB in {d:.1} s\n", .{ c.layers, gib(w.bytes), secs(io, t0) });
++    const shape: ink.forward.Shape = .{ .rows = @min(chunk, longest), .context = std.mem.alignForward(usize, longest + 1, 64), .heads = w.share.heads.len(), .kv = w.share.kv.len() };
++    var b = try ink.forward.Buffers.init(gpa, &driver, &w, shape);
++    defer b.deinit();
++    var st = try ink.forward.State.init(gpa, &driver, &w.config, shape);
++    defer st.deinit();
++    const f: ink.forward.Forward = .{ .d = &driver, .m = &m, .w = &w, .b = &b, .shape = shape, .stream = stream };
++    try std.Io.Dir.cwd().createDirPath(io, args[3]);
++    var out = try std.Io.Dir.cwd().openDir(io, args[3], .{});
++    defer out.close(io);
++    const nv = w.share.vocab.len();
++    const real: usize = c.real_vocab;
++    const row = try gpa.alloc(f32, shape.rows * nv);
++    defer gpa.free(row);
++    it = doc.value.object.iterator();
++    while (it.next()) |e| {
++        const list = e.value_ptr.array.items;
++        const ids = try a.alloc(i32, list.len);
++        for (list, ids) |v, *id| id.* = @intCast(v.integer);
++        const all = try gpa.alloc(f32, ids.len * real);
++        defer gpa.free(all);
++        for ([_][]const u8{ "prompt", "decode" }) |path| {
++            try stream.synchronize();
++            try st.reset();
++            t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++            const step = if (std.mem.eql(u8, path, "prompt")) shape.rows else 1;
++            var at: usize = 0;
++            while (at < ids.len) : (at += step) {
++                const n = @min(step, ids.len - at);
++                try f.run(&st, ids[at..][0..n]);
++                try stream.synchronize();
++                try b.logits.download(0, std.mem.sliceAsBytes(row[0 .. n * nv]));
++                for (0..n) |r| @memcpy(all[(at + r) * real ..][0..real], row[r * nv ..][0..real]);
++            }
++            var name: [96]u8 = undefined;
++            try out.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name, "{s}.{s}.f32", .{ e.key_ptr.*, path }), .data = std.mem.sliceAsBytes(all) });
++            const last = all[(ids.len - 1) * real ..][0..real];
++            std.debug.print("{s} {s}: {d} rows in {d:.2} s, last row argmax {d}\n", .{ e.key_ptr.*, path, ids.len, secs(io, t0), std.mem.indexOfMax(f32, last) });
++        }
++    }
++    return 0;
++}
++
++fn gib(x: u64) f64 {
++    return @as(f64, @floatFromInt(x)) / (1 << 30);
++}
++
++fn secs(io: std.Io, t0: anytype) f64 {
++    return @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) * 1e-9;
++}
+diff --git a/zig/src/families/inkling2/exl3.zig b/zig/src/families/inkling2/exl3.zig
+new file mode 100644
+index 0000000..8bc36f5
+--- /dev/null
++++ b/zig/src/families/inkling2/exl3.zig
+@@ -0,0 +1,216 @@
++//! Inkling 2's EXL3 tensors (exllamav3 1.x, mul1, G1's inkling2 overlay): projections cut to a rank, grouped experts.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const shard = @import("shard.zig");
++
++const Tensor = core.checkpoint.Tensor;
++
++/// The mul1 codebook marker's value.
++const mul1_magic: u32 = 0x83DCD12D;
++
++/// What a rank takes of a projection: all of it, its output columns, or its input rows (each a multiple of 128).
++pub const Cut = union(enum) { whole, cols: shard.Span, rows: shard.Span };
++
++/// The device side of a load: uploads go through `put`, dense weights reserve their scratch on `dense`.
++pub const Sink = struct {
++    ctx: *anyopaque,
++    put: *const fn (ctx: *anyopaque, bytes: []const u8) anyerror!u64,
++    dense: *cuda.exl3.Dense,
++    stream: cuda.Stream,
++};
++
++/// config.json's quantization_config: EXL3 from exllamav3 1.x on mul1 (each tensor's width is checked as it loads).
++pub fn admit(gpa: std.mem.Allocator, config_json: []const u8) !void {
++    const doc = try std.json.parseFromSlice(std.json.Value, gpa, config_json, .{});
++    defer doc.deinit();
++    if (doc.value != .object) return error.NotExl3;
++    const q = doc.value.object.get("quantization_config") orelse return error.NotExl3;
++    if (q != .object) return error.NotExl3;
++    const method = q.object.get("quant_method") orelse return error.NotExl3;
++    if (method != .string or !std.mem.eql(u8, method.string, "exl3")) return error.NotExl3;
++    const book = q.object.get("codebook") orelse return error.UnsupportedExl3;
++    if (book != .string or !std.mem.eql(u8, book.string, "mul1")) return error.UnsupportedExl3;
++    const version = q.object.get("version") orelse return error.UnsupportedExl3;
++    if (version != .string or !std.mem.startsWith(u8, version.string, "1.")) return error.UnsupportedExl3;
++}
++
++/// One stored projection's tensors, checked: trellis [k/16][n/16][16 * bits] i16, the mul1 marker, fp16 suh and svh.
++pub const Group = struct {
++    trellis: Tensor,
++    suh: Tensor,
++    svh: Tensor,
++    halves: u32,
++
++    fn tile(g: Group) usize {
++        return g.halves * 16;
++    }
++};
++
++pub fn group(ck: *core.Checkpoint, base: []const u8, n: usize, k: usize) !Group {
++    var buf: [192]u8 = undefined;
++    const t = try ck.get(try std.fmt.bufPrint(&buf, "{s}.trellis", .{base}));
++    if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != k / 16 or t.dim(1) != n / 16 or t.dim(2) % 8 != 0) {
++        std.log.err("inkling2: {s}.trellis is not [{d}, {d}, 16 * bits]", .{ base, k / 16, n / 16 });
++        return error.UnexpectedInkling2Tensor;
++    }
++    const halves = t.dim(2) / 8;
++    if (halves < 2 or halves > 16) return error.UnsupportedExl3;
++    const marker = try ck.get(try std.fmt.bufPrint(&buf, "{s}.mul1", .{base}));
++    if (marker.dtype != .i32 or marker.bytes.len != 4 or std.mem.readInt(u32, marker.bytes[0..4], .little) != mul1_magic) return error.UnsupportedExl3;
++    const suh = try ck.get(try std.fmt.bufPrint(&buf, "{s}.suh", .{base}));
++    const svh = try ck.get(try std.fmt.bufPrint(&buf, "{s}.svh", .{base}));
++    if (!suh.is(.f16, &.{k}) or !svh.is(.f16, &.{n})) return error.UnexpectedInkling2Tensor;
++    return .{ .trellis = t, .suh = suh, .svh = svh, .halves = @intCast(halves) };
++}
++
++/// The cut's shape (k, n) and, appended to `out`, its trellis words, suh and svh in the stored layout.
++pub fn cut(gpa: std.mem.Allocator, g: Group, n: usize, k: usize, c: Cut, out: *std.ArrayList(u8), suh: *std.ArrayList(u8), svh: *std.ArrayList(u8)) ![2]usize {
++    const tb = g.tile();
++    const nt = n / 16;
++    const tr = g.trellis.bytes;
++    switch (c) {
++        .whole => {
++            try out.appendSlice(gpa, tr);
++            try suh.appendSlice(gpa, g.suh.bytes);
++            try svh.appendSlice(gpa, g.svh.bytes);
++            return .{ k, n };
++        },
++        .cols => |s| {
++            if (s.lo % 128 != 0 or s.len() % 128 != 0 or s.hi > n or s.len() == 0) return error.BadSplit;
++            for (0..k / 16) |kt| try out.appendSlice(gpa, tr[(kt * nt + s.lo / 16) * tb ..][0 .. s.len() / 16 * tb]);
++            try suh.appendSlice(gpa, g.suh.bytes);
++            try svh.appendSlice(gpa, g.svh.bytes[2 * s.lo .. 2 * s.hi]);
++            return .{ k, s.len() };
++        },
++        .rows => |s| {
++            if (s.lo % 128 != 0 or s.len() % 128 != 0 or s.hi > k or s.len() == 0) return error.BadSplit;
++            try out.appendSlice(gpa, tr[s.lo / 16 * nt * tb .. s.hi / 16 * nt * tb]);
++            try suh.appendSlice(gpa, g.suh.bytes[2 * s.lo .. 2 * s.hi]);
++            try svh.appendSlice(gpa, g.svh.bytes);
++            return .{ s.len(), n };
++        },
++    }
++}
++
++/// The stored [n][k] projection under `base`, cut to the rank, on the device for cuda.exl3.Dense.
++pub fn linear(gpa: std.mem.Allocator, ck: *core.Checkpoint, sink: Sink, base: []const u8, n: usize, k: usize, c: Cut) !cuda.exl3.Weight {
++    const g = try group(ck, base, n, k);
++    if (cuda.exl3.variantIndex(g.halves, .mul1, 4) == null) return error.UnsupportedExl3;
++    var tr: std.ArrayList(u8) = .empty;
++    defer tr.deinit(gpa);
++    var su: std.ArrayList(u8) = .empty;
++    defer su.deinit(gpa);
++    var sv: std.ArrayList(u8) = .empty;
++    defer sv.deinit(gpa);
++    const kn = try cut(gpa, g, n, k, c, &tr, &su, &sv);
++    const st = cuda.exl3.strides(kn[0], kn[1], g.halves, false);
++    const w: cuda.exl3.Weight = .{
++        .trellis = try sink.put(sink.ctx, tr.items),
++        .suh = try sink.put(sink.ctx, su.items),
++        .svh = try sink.put(sink.ctx, sv.items),
++        .k = @intCast(kn[0]),
++        .n = @intCast(kn[1]),
++        .halves = g.halves,
++        .codebook = .mul1,
++        .stride_k = st.k,
++        .stride_nb = st.nb,
++    };
++    try sink.dense.reserve(sink.stream, w);
++    return w;
++}
++
++/// Layer `i`'s 384 routed experts as one grouped EXL3 layer: gate and up by the rank's columns, down by its rows.
++pub fn experts(gpa: std.mem.Allocator, ck: *core.Checkpoint, sink: Sink, prefix: []const u8, i: u32, count: usize, d: usize, inter: usize, span: shard.Span) !cuda.exl3_experts.Layer {
++    const mods = [3][]const u8{ "gate_proj", "up_proj", "down_proj" };
++    var ptrs: [3]u64 = undefined;
++    var k2: [3]u64 = undefined;
++    var suh: [3]u64 = undefined;
++    var svh: [3]u64 = undefined;
++    var base_buf: [160]u8 = undefined;
++    for (mods, 0..) |mod, m| {
++        const down = m == 2;
++        const n = if (down) d else inter;
++        const k = if (down) inter else d;
++        var tr: std.ArrayList(u8) = .empty;
++        defer tr.deinit(gpa);
++        var su: std.ArrayList(u8) = .empty;
++        defer su.deinit(gpa);
++        var sv: std.ArrayList(u8) = .empty;
++        defer sv.deinit(gpa);
++        const at = try gpa.alloc(usize, count);
++        defer gpa.free(at);
++        const widths = try gpa.alloc(i32, count);
++        defer gpa.free(widths);
++        for (0..count) |e| {
++            const base = try std.fmt.bufPrint(&base_buf, "{s}layers.{d}.mlp.experts.{d}.{s}", .{ prefix, i, e, mod });
++            const g = try group(ck, base, n, k);
++            at[e] = tr.items.len;
++            widths[e] = @intCast(g.halves);
++            _ = try cut(gpa, g, n, k, if (down) .{ .rows = span } else .{ .cols = span }, &tr, &su, &sv);
++        }
++        const words = try sink.put(sink.ctx, tr.items);
++        const table = try gpa.alloc(u64, count);
++        defer gpa.free(table);
++        for (table, at) |*t, off| t.* = words + off;
++        ptrs[m] = try sink.put(sink.ctx, std.mem.sliceAsBytes(table));
++        k2[m] = try sink.put(sink.ctx, std.mem.sliceAsBytes(widths));
++        suh[m] = try sink.put(sink.ctx, su.items);
++        svh[m] = try sink.put(sink.ctx, sv.items);
++        ck.release();
++    }
++    return .{
++        .gate = ptrs[0],
++        .up = ptrs[1],
++        .down = ptrs[2],
++        .gate_k2 = k2[0],
++        .up_k2 = k2[1],
++        .down_k2 = k2[2],
++        .suh_g = suh[0],
++        .suh_u = suh[1],
++        .svh_g = svh[0],
++        .svh_u = svh[1],
++        .suh_d = suh[2],
++        .svh_d = svh[2],
++        .experts = count,
++        .dims = d,
++        .width = span.len(),
++        .codebook = .mul1,
++    };
++}
++
++test "exl3: admit takes exllamav3 1.x on mul1 and refuses other codebooks, versions and formats" {
++    const a = std.testing.allocator;
++    try admit(a, "{\"quantization_config\":{\"quant_method\":\"exl3\",\"version\":\"1.6.6\",\"codebook\":\"mul1\"}}");
++    try std.testing.expectError(error.UnsupportedExl3, admit(a, "{\"quantization_config\":{\"quant_method\":\"exl3\",\"version\":\"1.6.6\",\"codebook\":\"mcg\"}}"));
++    try std.testing.expectError(error.UnsupportedExl3, admit(a, "{\"quantization_config\":{\"quant_method\":\"exl3\",\"version\":\"0.9\",\"codebook\":\"mul1\"}}"));
++    try std.testing.expectError(error.NotExl3, admit(a, "{\"text_config\":{}}"));
++}
++
++test "exl3: a cut takes a rank's tile columns of every k row, or its whole tile rows, with the matching scales" {
++    const a = std.testing.allocator;
++    var words: [16 * 16 * 32]u8 = undefined;
++    for (0..16) |kt| for (0..16) |nt| @memset(words[(kt * 16 + nt) * 32 ..][0..32], @intCast(kt * 16 + nt));
++    var scales: [512]u8 = undefined;
++    for (&scales, 0..) |*s, j| s.* = @intCast(j / 2 % 256);
++    const t: Tensor = .{ .dtype = .i16, .rank = 3, .shape = .{ 16, 16, 16, 1, 1 }, .bytes = &words };
++    const v: Tensor = .{ .dtype = .f16, .rank = 1, .shape = .{ 256, 1, 1, 1, 1 }, .bytes = &scales };
++    const g: Group = .{ .trellis = t, .suh = v, .svh = v, .halves = 2 };
++    var tr: std.ArrayList(u8) = .empty;
++    defer tr.deinit(a);
++    var su: std.ArrayList(u8) = .empty;
++    defer su.deinit(a);
++    var sv: std.ArrayList(u8) = .empty;
++    defer sv.deinit(a);
++    try std.testing.expectEqual([2]usize{ 256, 128 }, try cut(a, g, 256, 256, .{ .cols = .{ .lo = 128, .hi = 256 } }, &tr, &su, &sv));
++    try std.testing.expectEqual(@as(u8, 8), tr.items[0]);
++    try std.testing.expectEqual(@as(u8, 16 + 8), tr.items[8 * 32]);
++    try std.testing.expectEqualSlices(u8, scales[256..], sv.items);
++    tr.clearRetainingCapacity();
++    su.clearRetainingCapacity();
++    sv.clearRetainingCapacity();
++    try std.testing.expectEqual([2]usize{ 128, 256 }, try cut(a, g, 256, 256, .{ .rows = .{ .lo = 128, .hi = 256 } }, &tr, &su, &sv));
++    try std.testing.expectEqual(@as(u8, 8 * 16), tr.items[0]);
++    try std.testing.expectEqualSlices(u8, scales[256..], su.items);
++    try std.testing.expectError(error.BadSplit, cut(a, g, 256, 256, .{ .cols = .{ .lo = 64, .hi = 192 } }, &tr, &su, &sv));
++}
+diff --git a/zig/src/families/inkling2/experts.zig b/zig/src/families/inkling2/experts.zig
+new file mode 100644
+index 0000000..da82c05
+--- /dev/null
++++ b/zig/src/families/inkling2/experts.zig
+@@ -0,0 +1,65 @@
++//! Inkling 2's routed experts on main's grouped EXL3 kernels, the gate/up epilogue swapped for the softcapped SwiGLU.
++const std = @import("std");
++const cuda = @import("cuda");
++const ops = @import("ops.zig");
++
++const ex = cuda.exl3_experts;
++
++/// The two SwiGLU softcaps (config.json mlp_gate_softcap, mlp_up_softcap).
++pub const Caps = struct { gate: f32, up: f32 };
++
++fn i32d(v: usize) i32 {
++    return @intCast(v);
++}
++
++/// exl3_experts.Experts.run's launches in its order, ops.cu's tf_ink2_gateup in place of the shared epilogue.
++pub fn run(e: *const ex.Experts, k: *const ops.Kernels, s: cuda.Stream, l: ex.Layer, caps: Caps, x: u64, x_stride: usize, x_dtype: ex.DType, pick: u64, wts: u64, rows: usize, out: u64, sc: ex.Scratch) !void {
++    const d = l.dims;
++    const w = l.width;
++    const slots = sc.slots;
++    if (rows < 1 or rows > sc.rows or slots < 1 or slots > 32 or l.experts < 1 or l.experts > 4096) return error.BadExperts;
++    const g_sk = try ex.plan(d, w, true);
++    const d_sk = try ex.plan(w, d, false);
++    const p = rows * slots;
++    const maxu = @min(p, l.experts);
++    const mt = (rows + 15) / 16;
++
++    var a: cuda.Args = .{};
++    for ([_]u64{ pick, sc.ids, sc.count, sc.members }) |v| a.add(v);
++    for ([_]usize{ rows, slots, l.experts, rows }) |v| a.add(i32d(v));
++    try cuda.launch.launch(e.group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = @intCast(rows * slots * 4) }, s, &a);
++
++    var r: cuda.Args = .{};
++    r.add(x);
++    r.add(i32d(x_stride));
++    r.add(@as(i32, @backingInt(x_dtype)));
++    for ([_]u64{ pick, l.suh_g, l.suh_u, sc.xg, sc.xu }) |v| r.add(v);
++    for ([_]usize{ d, slots, l.experts }) |v| r.add(i32d(v));
++    try cuda.launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(p), .y = @intCast(d / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &r);
++
++    var g: cuda.Args = .{};
++    for ([_]u64{ sc.xg, sc.xu, l.gate, l.up, l.gate_k2, l.up_k2, sc.ids, sc.count, sc.members, sc.z }) |v| g.add(v);
++    for ([_]usize{ d, w, p, g_sk, rows, slots, maxu }) |v| g.add(i32d(v));
++    for ([_]i32{ 2, i32d(l.gu_stride), 0, -1 }) |v| g.add(v);
++    try cuda.launch.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128 } }, s, &g);
++
++    try ops.gateup(k, s, .{ .z = sc.z, .pick = pick, .svh_g = l.svh_g, .svh_u = l.svh_u, .suh_d = l.suh_d, .xd = sc.xd, .p = i32d(p), .n = i32d(w), .sk = i32d(g_sk), .experts = i32d(l.experts), .gate_cap = caps.gate, .up_cap = caps.up });
++
++    var dn: cuda.Args = .{};
++    for ([_]u64{ sc.xd, sc.xd, l.down, l.down, l.down_k2, l.down_k2, sc.ids, sc.count, sc.members, sc.z }) |v| dn.add(v);
++    for ([_]usize{ w, d, p, d_sk, rows, slots, maxu }) |v| dn.add(i32d(v));
++    for ([_]i32{ 1, 0, 0, -1 }) |v| dn.add(v);
++    try cuda.launch.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128 } }, s, &dn);
++
++    var cb: cuda.Args = .{};
++    for ([_]u64{ sc.z, pick, l.svh_d, sc.y, wts, out }) |v| cb.add(v);
++    for ([_]usize{ p, d, d_sk, l.experts, slots }) |v| cb.add(i32d(v));
++    try cuda.launch.launch(e.down_combine, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(d / 128) }, .block = .{ .x = @intCast(32 * slots) } }, s, &cb);
++}
++
++test "experts: Inkling's expert shapes have built tiles (gate/up 4608 -> 2304 whole and a rank's 1152, down back)" {
++    try std.testing.expectEqual(@as(u32, 4), try ex.plan(4608, 2304, true));
++    try std.testing.expectEqual(@as(u32, 4), try ex.plan(4608, 1152, true));
++    _ = try ex.plan(2304, 4608, false);
++    _ = try ex.plan(1152, 4608, false);
++}
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+new file mode 100644
+index 0000000..5d7bd14
+--- /dev/null
++++ b/zig/src/families/inkling2/forward.zig
+@@ -0,0 +1,301 @@
++//! Inkling 2's decoder forward on one rank: one stream's rows (a prompt chunk or decode rows) to softcapped logits.
++const std = @import("std");
++const cuda = @import("cuda");
++const cfg = @import("config.zig");
++const kernels = @import("kernels.zig");
++const ops = @import("ops.zig");
++const experts = @import("experts.zig");
++const weights = @import("weights.zig");
++
++const Buf = cuda.DeviceBuffer;
++
++/// The kernels a forward launches: main's dense and grouped EXL3, the family's attention and glue.
++pub const Modules = struct {
++    dense: cuda.exl3.Dense,
++    experts: cuda.exl3_experts.Experts,
++    attn: kernels.Kernels,
++    ops: ops.Kernels,
++
++    pub fn load(d: *const cuda.Driver) !Modules {
++        var dense = try cuda.exl3.Dense.load(d);
++        errdefer dense.unload();
++        var ex = try cuda.exl3_experts.Experts.load(d);
++        errdefer ex.unload();
++        var attn = try kernels.Kernels.load(d);
++        errdefer attn.unload();
++        return .{ .dense = dense, .experts = ex, .attn = attn, .ops = try ops.Kernels.load(d) };
++    }
++
++    pub fn deinit(m: *Modules) void {
++        m.ops.unload();
++        m.attn.unload();
++        m.experts.unload();
++        m.dense.unload();
++    }
++};
++
++/// The geometry a stream's caches and a call's scratch are sized for.
++pub const Shape = struct {
++    rows: usize, // most rows a call takes
++    context: usize, // most positions a stream reaches
++    heads: usize, // the rank's query heads
++    kv: usize, // the rank's key heads
++
++    fn sliding(s: Shape, c: *const cfg.Config) kernels.Layer {
++        return kernels.Layer.sliding(c.window, @intCast(s.rows));
++    }
++
++    fn global(s: Shape) kernels.Layer {
++        return kernels.Layer.global(@intCast(s.context));
++    }
++
++    fn layer(s: Shape, c: *const cfg.Config, i: usize) kernels.Layer {
++        return if (c.layer[i] == .sliding) s.sliding(c) else s.global();
++    }
++
++    fn chunks(s: Shape) u32 {
++        return @max(kernels.chunks(s.context - 1, kernels.sliding_chunk), kernels.chunks(s.context - 1, kernels.global_chunk));
++    }
++};
++
++fn alloc(d: *const cuda.Driver, list: *std.ArrayList(Buf), gpa: std.mem.Allocator, bytes: usize) !u64 {
++    var b = try Buf.alloc(d, @max(bytes, 256));
++    errdefer b.free();
++    try b.fill8(0, null);
++    try list.append(gpa, b);
++    return b.ptr;
++}
++
++/// One stream's caches and conv states: K and V rings a layer, the last three inputs of each short convolution.
++pub const State = struct {
++    gpa: std.mem.Allocator,
++    bufs: std.ArrayList(Buf) = .empty,
++    kc: []u64 = &.{},
++    vc: []u64 = &.{},
++    conv: [][4]u64 = &.{}, // k, v (fp32 [3][kv * 128]) and attention, MLP (fp32 [3][hidden]) a layer
++    pos: usize = 0, // positions the caches hold
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: *const cfg.Config, s: Shape) !State {
++        var st: State = .{ .gpa = gpa };
++        errdefer st.deinit();
++        st.kc = try gpa.alloc(u64, c.layers);
++        st.vc = try gpa.alloc(u64, c.layers);
++        st.conv = try gpa.alloc([4]u64, c.layers);
++        for (0..c.layers) |i| {
++            const ring: usize = s.layer(c, i).ring;
++            st.kc[i] = try alloc(d, &st.bufs, gpa, s.kv * ring * c.head_dim * 2);
++            st.vc[i] = try alloc(d, &st.bufs, gpa, s.kv * ring * c.head_dim * 2);
++            for (0..2) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, 3 * s.kv * c.head_dim * 4);
++            for (2..4) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, 3 * @as(usize, c.hidden) * 4);
++        }
++        return st;
++    }
++
++    /// Back to an empty stream: caches and conv states zeroed.
++    pub fn reset(st: *State) !void {
++        for (st.bufs.items) |b| try b.fill8(0, null);
++        st.pos = 0;
++    }
++
++    pub fn deinit(st: *State) void {
++        for (st.bufs.items) |*b| b.free();
++        st.bufs.deinit(st.gpa);
++        st.gpa.free(st.kc);
++        st.gpa.free(st.vc);
++        st.gpa.free(st.conv);
++    }
++};
++
++/// A call's scratch, sized for Shape.rows rows.
++pub const Buffers = struct {
++    gpa: std.mem.Allocator,
++    bufs: std.ArrayList(Buf) = .empty,
++    ids: Buf = undefined, // int32 rows, then pos, seg_of, the segment and the tiles
++    x: u64 = 0, // bf16 [rows][hidden]: the residual stream between layers
++    resid: u64 = 0, // fp32 [rows][hidden]: the residual inside a layer
++    blocks: u64 = 0, // bf16 [8][rows][hidden]: the completed blocks' inputs of these rows
++    normed: u64 = 0, // bf16 [3][rows][hidden]
++    q: u64 = 0,
++    r: u64 = 0,
++    gate: u64 = 0,
++    kf: u64 = 0,
++    vf: u64 = 0,
++    kraw: u64 = 0,
++    vraw: u64 = 0,
++    dk: u64 = 0,
++    dv: u64 = 0,
++    sink: u64 = 0,
++    qo: u64 = 0,
++    relo: u64 = 0,
++    tab: u64 = 0,
++    part_o: u64 = 0,
++    part_ml: u64 = 0,
++    att: u64 = 0,
++    ao: u64 = 0,
++    scores: u64 = 0,
++    pick: u64 = 0,
++    wts: u64 = 0,
++    moe: u64 = 0,
++    exs: cuda.exl3_experts.Scratch = undefined,
++    logits: Buf = undefined, // fp32 [rows][padded vocab of the rank]
++
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, s: Shape) !Buffers {
++        const c = &w.config;
++        var b: Buffers = .{ .gpa = gpa };
++        errdefer b.deinit();
++        const n = s.rows;
++        const h: usize = c.hidden;
++        const hd: usize = c.head_dim;
++        const A = struct {
++            fn f(bb: *Buffers, dd: *const cuda.Driver, bytes: usize) !u64 {
++                return alloc(dd, &bb.bufs, bb.gpa, bytes);
++            }
++        }.f;
++        b.ids = try Buf.alloc(d, n * 12 + 64 + kernels.tileCount(n, c.group()) * 8 + 256);
++        b.x = try A(&b, d, n * h * 2);
++        b.resid = try A(&b, d, n * h * 4);
++        b.blocks = try A(&b, d, ops.max_blocks * n * h * 2);
++        b.normed = try A(&b, d, 3 * n * h * 2);
++        b.q = try A(&b, d, n * s.heads * hd * 2);
++        b.r = try A(&b, d, n * s.heads * c.d_rel * 2);
++        b.gate = try A(&b, d, n * s.heads * hd * 2);
++        b.kf = try A(&b, d, n * s.kv * hd * 4);
++        b.vf = try A(&b, d, n * s.kv * hd * 4);
++        b.kraw = try A(&b, d, n * s.kv * hd * 2);
++        b.vraw = try A(&b, d, n * s.kv * hd * 2);
++        b.dk = try A(&b, d, n * s.kv * c.conv * 4);
++        b.dv = try A(&b, d, n * s.kv * c.conv * 4);
++        b.sink = try A(&b, d, n * s.heads * 2);
++        b.qo = try A(&b, d, n * s.heads * hd * 2);
++        b.relo = try A(&b, d, n * s.heads * c.d_rel * 2);
++        b.tab = try A(&b, d, kernels.tableBytes(n, @intCast(s.heads)));
++        const nc = s.chunks();
++        b.part_o = try A(&b, d, n * s.heads * nc * hd * 4);
++        b.part_ml = try A(&b, d, n * s.heads * nc * 8);
++        b.att = try A(&b, d, n * s.heads * hd * 2);
++        b.ao = try A(&b, d, n * h * 4);
++        b.scores = try A(&b, d, n * @as(usize, c.experts) * 4);
++        b.pick = try A(&b, d, n * c.topk * 4);
++        b.wts = try A(&b, d, n * c.topk * 4);
++        b.moe = try A(&b, d, n * h * 4);
++        const el = w.layers[0].experts;
++        b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try cuda.exl3_experts.scratchBytes(el, n, c.topk)), el, n, c.topk);
++        b.logits = try Buf.alloc(d, n * w.share.vocab.len() * 4);
++        return b;
++    }
++
++    pub fn deinit(b: *Buffers) void {
++        for (b.bufs.items) |*x| x.free();
++        b.bufs.deinit(b.gpa);
++        if (b.ids.len != 0) b.ids.free();
++        if (b.logits.len != 0) b.logits.free();
++    }
++};
++
++pub const Forward = struct {
++    d: *const cuda.Driver,
++    m: *Modules,
++    w: *const weights.Weights,
++    b: *Buffers,
++    shape: Shape,
++    stream: cuda.Stream,
++
++    fn dense(f: Forward, wt: cuda.exl3.Weight, x: u64, rows: usize, y: u64, dt: cuda.exl3.DType) !void {
++        try f.m.dense.decode(f.stream, wt, x, .bf16, rows, y, dt);
++    }
++
++    /// `ids` at the stream's next positions through every layer; the rows' logits land in b.logits.
++    pub fn run(f: Forward, st: *State, ids: []const i32) !void {
++        const c = &f.w.config;
++        const n = ids.len;
++        if (n == 0 or n > f.shape.rows or st.pos + n > f.shape.context) return error.Inkling2Rows;
++        const h: usize = c.hidden;
++        const s = f.stream;
++        const k = &f.m.ops;
++        const b = f.b;
++        const p0 = st.pos;
++        // stage: ids, positions, segment of each row, the one segment, the attention tiles
++        var host: std.ArrayList(u8) = .empty;
++        defer host.deinit(f.w.gpa);
++        const gpa = f.w.gpa;
++        try host.appendSlice(gpa, std.mem.sliceAsBytes(ids));
++        for (0..n) |i| try host.appendSlice(gpa, std.mem.asBytes(&@as(i32, @intCast(p0 + i))));
++        try host.appendNTimes(gpa, 0, n * 4);
++        const seg_at = std.mem.alignForward(usize, host.items.len, 16);
++        try host.appendNTimes(gpa, 0, seg_at - host.items.len);
++        const seg = [_]kernels.Seg{.{ .row0 = 0, .n = @intCast(n), .p0 = @intCast(p0), .off = 0 }};
++        try host.appendSlice(gpa, std.mem.sliceAsBytes(&seg));
++        const tiles_at = host.items.len;
++        var tl: [4096]kernels.Tile = undefined;
++        const nt = try kernels.tiles(&seg, c.group(), &tl);
++        try host.appendSlice(gpa, std.mem.sliceAsBytes(tl[0..nt]));
++        try s.synchronize(); // the previous call's kernels may still read the staged rows
++        try b.ids.upload(0, host.items);
++        const base = b.ids.ptr;
++        const rows: kernels.Rows = .{ .rows = @intCast(n), .heads = @intCast(f.shape.heads), .kv_heads = @intCast(f.shape.kv), .pos = base + n * 4, .seg_of = base + n * 8, .segs = base + seg_at, .tiles = base + tiles_at, .n_tiles = @intCast(nt), .last_pos = @intCast(p0 + n - 1) };
++
++        try ops.embed(k, s, base, n, f.w.embed, f.w.embed_norm, b.x, h, c.eps);
++        var nb: usize = 0;
++        const hd: usize = c.head_dim;
++        const kvw = f.shape.kv * hd;
++        for (f.w.layers, 0..) |*l, i| {
++            const global = l.kind == .global;
++            var mix: ops.MixArgs = .{ .partial = b.x, .query = l.attn_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = @intCast(l.nq), .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
++            for (0..nb) |j| mix.blocks[j] = b.blocks + j * n * h * 2;
++            mix.norm = l.norms;
++            try ops.mix(k, s, mix);
++            const xq = b.normed;
++            const xk = if (global) b.normed + n * h * 2 else xq;
++            const xv = if (global) b.normed + 2 * n * h * 2 else xq;
++            const a = &l.attn;
++            try f.dense(a.q, xq, n, b.q, .bf16);
++            try f.dense(a.r, xq, n, b.r, .bf16);
++            try f.dense(a.gate, xq, n, b.gate, .bf16);
++            try f.dense(a.k, xk, n, b.kf, .f32);
++            try f.dense(a.v, xv, n, b.vf, .f32);
++            try ops.rowdot(k, s, xq, a.sink, b.sink, n, f.shape.heads, h, true, false);
++            const cv = st.conv[i];
++            if (global) {
++                try ops.rowdot(k, s, xk, a.k_proj, b.dk, n, f.shape.kv * c.conv, h, false, false);
++                try ops.rowdot(k, s, xv, a.v_proj, b.dv, n, f.shape.kv * c.conv, h, false, false);
++            }
++            try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw });
++            try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw });
++            const lay = f.shape.layer(c, i);
++            const prep: kernels.Prep = .{ .qk_clip = c.qk_clip, .rel_clip = c.rel_clip, .floor = c.log_floor, .alpha = c.log_alpha, .eps = c.eps };
++            try kernels.prep(&f.m.attn, s, rows, lay, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.kc[i], st.vc[i]);
++            try kernels.relTable(&f.m.attn, s, rows, b.relo, a.rel_proj, b.tab);
++            try kernels.attend(&f.m.attn, s, rows, lay, b.qo, st.kc[i], st.vc[i], b.tab, b.part_o, b.part_ml, b.sink, b.gate, b.att);
++            try f.dense(a.o, b.att, n, b.ao, .f32);
++            const boundary = i % c.block_layers == 0;
++            if (boundary) {
++                if (nb == ops.max_blocks) return error.Inkling2Blocks;
++                try copy(f.d, b.blocks + nb * n * h * 2, b.x, n * h * 2, s);
++                nb += 1;
++            }
++            try ops.conv(k, s, .{ .x = b.ao, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1 });
++            var mm: ops.MixArgs = .{ .partial = b.resid, .query = l.mlp_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 0, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
++            for (0..nb) |j| mm.blocks[j] = b.blocks + j * n * h * 2;
++            mm.norm[0] = l.mlp_norm;
++            try ops.mix(k, s, mm);
++            try ops.rowdot(k, s, b.normed, l.router, b.scores, n, c.experts, h, false, true);
++            try ops.topk(k, s, b.scores, l.bias, b.pick, b.wts, n, c.experts, c.topk, c.route_scale);
++            try experts.run(&f.m.experts, k, s, l.experts, .{ .gate = c.gate_softcap, .up = c.up_softcap }, b.normed, h, .bf16, b.pick, b.wts, n, b.moe, b.exs);
++            try ops.conv(k, s, .{ .x = b.moe, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2 });
++        }
++        var fm: ops.MixArgs = .{ .partial = b.x, .query = f.w.out_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
++        for (0..nb) |j| fm.blocks[j] = b.blocks + j * n * h * 2;
++        fm.norm[0] = f.w.norm;
++        try ops.mix(k, s, fm);
++        const nv = f.w.share.vocab.len();
++        try f.dense(f.w.head, b.normed, n, b.logits.ptr, .f32);
++        try ops.softcap(k, s, b.logits.ptr, n * nv, c.logit_softcap);
++        st.pos += n;
++    }
++};
++
++/// `bytes` from `src` to `dst` on the stream (a borrowed view of the destination).
++fn copy(d: *const cuda.Driver, dst: u64, src: u64, bytes: usize, s: cuda.Stream) !void {
++    const view: Buf = .{ .d = d, .ptr = dst, .len = bytes, .borrowed = true };
++    try view.copyFrom(0, src, bytes, s.handle);
++}
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index 8010496..aa2c32f 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -1,10 +1,16 @@
+-//! Inkling 2 Small (model_type inkling2) on CUDA: config, chat wiring, reply split, admission and attention kernels.
++//! Inkling 2 Small (model_type inkling2) on CUDA: config, chat, reply split, admission, kernels, EXL3 weights, forward.
+ 
+ pub const config = @import("config.zig");
+ pub const chat = @import("chat.zig");
+ pub const reply = @import("reply.zig");
+ pub const admit = @import("admit.zig");
+ pub const kernels = @import("kernels.zig");
++pub const ops = @import("ops.zig");
++pub const shard = @import("shard.zig");
++pub const exl3 = @import("exl3.zig");
++pub const weights = @import("weights.zig");
++pub const experts = @import("experts.zig");
++pub const forward = @import("forward.zig");
+ 
+ /// config.json's name in the release.
+ pub const model_type = "inkling2";
+@@ -15,4 +21,10 @@ test {
+     _ = reply;
+     _ = admit;
+     _ = kernels;
++    _ = ops;
++    _ = shard;
++    _ = exl3;
++    _ = weights;
++    _ = experts;
++    _ = forward;
+ }
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+new file mode 100644
+index 0000000..bddab85
+--- /dev/null
++++ b/zig/src/families/inkling2/ops.zig
+@@ -0,0 +1,158 @@
++//! Inkling 2's glue kernels (inkling2/ops.cu): embedding, residual mix, row dots, router, SwiGLU epilogue, convs.
++const std = @import("std");
++const cuda = @import("cuda");
++
++pub const max_blocks = 8;
++pub const max_queries = 3;
++
++/// ops.cu's MixArgs, field for field.
++pub const MixArgs = extern struct {
++    blocks: [max_blocks]u64 = @splat(0),
++    partial: u64,
++    query: u64,
++    norm: [max_queries]u64 = @splat(0),
++    out: u64,
++    n_blocks: i32,
++    partial_bf16: i32,
++    nq: i32,
++    rows: i32,
++    c: i32,
++    eps: f32,
++};
++
++/// ops.cu's ConvArgs, field for field.
++pub const ConvArgs = extern struct {
++    x: u64,
++    state: u64,
++    w: u64,
++    dyn: u64 = 0,
++    base: u64 = 0,
++    resid: u64 = 0,
++    out: u64 = 0,
++    x_bf16: i32 = 0,
++    round_in: i32 = 0,
++    heads: i32 = 1,
++    c: i32,
++    rows: i32,
++    mode: i32,
++};
++
++/// ops.cu's GateUpArgs, field for field.
++pub const GateUpArgs = extern struct {
++    z: u64,
++    pick: u64,
++    svh_g: u64,
++    svh_u: u64,
++    suh_d: u64,
++    xd: u64,
++    p: i32,
++    n: i32,
++    sk: i32,
++    experts: i32,
++    gate_cap: f32,
++    up_cap: f32,
++};
++
++pub const Kernels = struct {
++    mod: cuda.Module,
++    embed: cuda.Function,
++    mix: cuda.Function,
++    rowdot: cuda.Function,
++    topk: cuda.Function,
++    gateup: cuda.Function,
++    conv: cuda.Function,
++    softcap: cuda.Function,
++
++    pub fn load(d: *const cuda.Driver) !Kernels {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var mod = try cuda.Module.load(d, cuda.kernels.inkling2_ops);
++        errdefer mod.unload();
++        return .{
++            .mod = mod,
++            .embed = try mod.function("tf_ink2_embed"),
++            .mix = try mod.function("tf_ink2_mix"),
++            .rowdot = try mod.function("tf_ink2_rowdot"),
++            .topk = try mod.function("tf_ink2_topk"),
++            .gateup = try mod.function("tf_ink2_gateup"),
++            .conv = try mod.function("tf_ink2_conv"),
++            .softcap = try mod.function("tf_ink2_softcap"),
++        };
++    }
++
++    pub fn unload(k: *Kernels) void {
++        k.mod.unload();
++        k.* = undefined;
++    }
++};
++
++fn int(x: anytype) i32 {
++    return @intCast(x);
++}
++
++fn go(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, a: *cuda.Args) !void {
++    try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads } }, s, a);
++}
++
++/// Embedding rows of `ids` (int32 on the device) through embed_norm into bf16 [rows, c].
++pub fn embed(k: *const Kernels, s: cuda.Stream, ids: u64, rows: usize, table: u64, norm: u64, out: u64, c: usize, eps: f32) !void {
++    var a: cuda.Args = .{};
++    for ([_]u64{ ids, table, norm, out }) |v| a.add(v);
++    a.add(int(c));
++    a.add(eps);
++    try go(k.embed, s, .{ .x = @intCast(rows) }, 256, &a);
++}
++
++/// The residual mix of each row and query, normed: a block a row.
++pub fn mix(k: *const Kernels, s: cuda.Stream, m: MixArgs) !void {
++    var a: cuda.Args = .{};
++    a.add(m);
++    try go(k.mix, s, .{ .x = @intCast(m.rows) }, 512, &a);
++}
++
++/// out[row, j] = x[row] . w[j] over `c` (bf16 in), `j` outputs a row, bf16 or fp32 out, sigmoid when `sigmoid`.
++pub fn rowdot(k: *const Kernels, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, j: usize, c: usize, out_bf16: bool, sigmoid: bool) !void {
++    var a: cuda.Args = .{};
++    for ([_]u64{ x, w, out }) |v| a.add(v);
++    for ([_]i32{ int(j), int(c), @intFromBool(out_bf16), @intFromBool(sigmoid) }) |v| a.add(v);
++    try go(k.rowdot, s, .{ .x = @intCast(rows), .y = @intCast((j + 7) / 8) }, 256, &a);
++}
++
++/// The router's picks and weights from fp32 sigmoid scores [rows, experts] and the selection bias.
++pub fn topk(k: *const Kernels, s: cuda.Stream, scores: u64, bias: u64, pick: u64, wts: u64, rows: usize, experts: usize, top: usize, scale: f32) !void {
++    if (experts > 512 * 8 or top > 32) return error.Inkling2RouterShape;
++    var a: cuda.Args = .{};
++    for ([_]u64{ scores, bias, pick, wts }) |v| a.add(v);
++    a.add(int(experts));
++    a.add(int(top));
++    a.add(scale);
++    try go(k.topk, s, .{ .x = @intCast(rows) }, 512, &a);
++}
++
++/// The softcapped SwiGLU epilogue over `p` (row, slot) pairs, `n` wide: the grid of exl3_experts' gate/up epilogue.
++pub fn gateup(k: *const Kernels, s: cuda.Stream, g: GateUpArgs) !void {
++    var a: cuda.Args = .{};
++    a.add(g);
++    try go(k.gateup, s, .{ .x = @intCast(g.p), .y = @intCast(@divExact(g.n, 128)) }, 32, &a);
++}
++
++/// A short convolution over a stream's rows, its state carried (ops.cu's tf_ink2_conv).
++pub fn conv(k: *const Kernels, s: cuda.Stream, c: ConvArgs) !void {
++    var a: cuda.Args = .{};
++    a.add(c);
++    try go(k.conv, s, .{ .x = @intCast(std.math.divCeil(i32, c.c, 128) catch unreachable) }, 128, &a);
++}
++
++/// tanh(x / cap) * cap over `n` fp32 logits in place.
++pub fn softcap(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, cap: f32) !void {
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(@as(i64, @intCast(n)));
++    a.add(cap);
++    try go(k.softcap, s, .{ .x = @intCast((n + 255) / 256) }, 256, &a);
++}
++
++test "ops: the argument structs keep ops.cu's layouts" {
++    try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
++    try std.testing.expectEqual(@as(usize, 7 * 8 + 6 * 4), @sizeOf(ConvArgs));
++    try std.testing.expectEqual(@as(usize, 6 * 8 + 6 * 4), @sizeOf(GateUpArgs));
++}
+diff --git a/zig/src/families/inkling2/shard.zig b/zig/src/families/inkling2/shard.zig
+new file mode 100644
+index 0000000..d0a36f7
+--- /dev/null
++++ b/zig/src/families/inkling2/shard.zig
+@@ -0,0 +1,67 @@
++//! A TP rank's share of Inkling 2: whole key heads (their query groups with them), 128-wide expert and vocab blocks.
++const std = @import("std");
++const cfg = @import("config.zig");
++
++/// [lo, hi) of something a rank holds.
++pub const Span = struct {
++    lo: usize,
++    hi: usize,
++
++    pub fn len(s: Span) usize {
++        return s.hi - s.lo;
++    }
++
++    /// Part `rank` of `world` of [0, n) in whole `unit`s, the earlier ranks taking any extra unit.
++    pub fn part(n: usize, unit: usize, rank: usize, world: usize) !Span {
++        if (n % unit != 0 or world == 0 or rank >= world) return error.BadSplit;
++        const units = n / unit;
++        if (units < world) return error.BadSplit;
++        const base = units / world;
++        const extra = units % world;
++        const lo = rank * base + @min(rank, extra);
++        return .{ .lo = lo * unit, .hi = (lo + base + @intFromBool(rank < extra)) * unit };
++    }
++};
++
++pub const Share = struct {
++    rank: usize,
++    world: usize,
++    kv: Span, // key heads
++    heads: Span, // query heads: the key heads' groups
++    inter: Span, // expert intermediate columns
++    vocab: Span, // padded vocabulary rows of the head
++
++    /// The rank's share; key heads must split evenly (each rank holds whole query groups and the same cache shape).
++    pub fn of(c: *const cfg.Config, padded_vocab: usize, rank: usize, world: usize) !Share {
++        if (c.kv_heads % world != 0) return error.BadSplit;
++        const kv = try Span.part(c.kv_heads, 1, rank, world);
++        const g = c.group();
++        return .{
++            .rank = rank,
++            .world = world,
++            .kv = kv,
++            .heads = .{ .lo = kv.lo * g, .hi = kv.hi * g },
++            .inter = try Span.part(c.intermediate, 128, rank, world),
++            .vocab = try Span.part(padded_vocab, 128, rank, world),
++        };
++    }
++
++    pub fn whole(s: Share) bool {
++        return s.world == 1;
++    }
++};
++
++test "shard: two ranks take whole key heads with their query groups, 128-wide expert and vocab blocks" {
++    const c: cfg.Config = .{};
++    const r0 = try Share.of(&c, 201088, 0, 2);
++    const r1 = try Share.of(&c, 201088, 1, 2);
++    try std.testing.expectEqual(Span{ .lo = 0, .hi = 4 }, r0.kv);
++    try std.testing.expectEqual(Span{ .lo = 24, .hi = 48 }, r1.heads);
++    try std.testing.expectEqual(Span{ .lo = 1152, .hi = 2304 }, r1.inter);
++    // 201,088 = 1,571 blocks of 128: rank 0 takes the odd one
++    try std.testing.expectEqual(Span{ .lo = 0, .hi = 786 * 128 }, r0.vocab);
++    try std.testing.expectEqual(@as(usize, 201088), r1.vocab.hi);
++    const one = try Share.of(&c, 201088, 0, 1);
++    try std.testing.expect(one.whole() and one.heads.len() == 48 and one.inter.len() == 2304);
++    try std.testing.expectError(error.BadSplit, Share.of(&c, 201088, 0, 3));
++}
+diff --git a/zig/src/families/inkling2/weights.zig b/zig/src/families/inkling2/weights.zig
+new file mode 100644
+index 0000000..587bf88
+--- /dev/null
++++ b/zig/src/families/inkling2/weights.zig
+@@ -0,0 +1,223 @@
++//! A TP rank's Inkling 2 weights from an EXL3 pack (G1's names): EXL3 projections and experts, the rest as stored.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const cfg = @import("config.zig");
++const shard = @import("shard.zig");
++const exl3 = @import("exl3.zig");
++
++const Tensor = core.checkpoint.Tensor;
++pub const Linear = cuda.exl3.Weight;
++
++/// The text decoder's tensors sit under this prefix; the vision tower and the drafter ship beside the pack.
++pub const prefix = "model.llm.";
++
++/// q, r, gate by the rank's query heads, k, v by its key heads, o by its rows; the raw tensors cut the same way.
++pub const Attention = struct {
++    q: Linear,
++    k: Linear,
++    v: Linear,
++    r: Linear,
++    gate: Linear,
++    o: Linear,
++    sink: u64, // bf16 [heads][hidden]
++    q_scale: u64, // bf16 [heads][128]
++    rel_scale: u64, // bf16 [heads][16]
++    rel_proj: u64, // bf16 [16][1024], whole
++    k_conv: u64, // sliding: bf16 [kv * 128][4]; global: static taps bf16 [4][kv * 128]
++    v_conv: u64,
++    k_proj: u64 = 0, // global: the dynamic taps' projection, bf16 [kv * 4][hidden]
++    v_proj: u64 = 0,
++};
++
++pub const Layer = struct {
++    kind: cfg.Kind,
++    norms: [3]u64, // attn_norm (sliding) or q/k/v input norms (global), bf16 [hidden]
++    attn_query: u64, // fp32 [nq][hidden]; 0 on layer 0 (no mix)
++    nq: u32,
++    mlp_query: u64, // fp32 [hidden]
++    mlp_norm: u64,
++    attn_conv: u64, // bf16 [hidden][4]
++    mlp_conv: u64,
++    attn: Attention,
++    router: u64, // bf16 [experts][hidden]
++    bias: u64, // fp32 [experts]
++    experts: cuda.exl3_experts.Layer,
++};
++
++pub const Weights = struct {
++    gpa: std.mem.Allocator,
++    d: *const cuda.Driver,
++    config: cfg.Config,
++    share: shard.Share,
++    padded_vocab: usize = 0,
++    embed: u64 = 0, // bf16 [vocab][hidden], whole on every rank
++    embed_norm: u64 = 0,
++    norm: u64 = 0,
++    out_query: u64 = 0, // fp32 [hidden]
++    head: Linear = undefined, // the rank's vocabulary rows of the 8-bit head
++    layers: []Layer = &.{},
++    buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
++    bytes: u64 = 0,
++
++    pub fn deinit(w: *Weights) void {
++        for (w.buffers.items) |*b| b.free();
++        w.buffers.deinit(w.gpa);
++        w.gpa.free(w.layers);
++        w.* = undefined;
++    }
++
++    fn put(ctx: *anyopaque, bytes: []const u8) anyerror!u64 {
++        const w: *Weights = @ptrCast(@alignCast(ctx));
++        const b = try cuda.DeviceBuffer.fromHost(w.d, bytes);
++        errdefer {
++            var owned = b;
++            owned.free();
++        }
++        try w.buffers.append(w.gpa, b);
++        w.bytes += b.len;
++        return b.ptr;
++    }
++};
++
++const Loader = struct {
++    gpa: std.mem.Allocator,
++    w: *Weights,
++    ck: *core.Checkpoint,
++    sink: exl3.Sink,
++    buf: [192]u8 = undefined,
++    name: []const u8 = "",
++
++    fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
++        L.name = try std.fmt.bufPrint(&L.buf, prefix ++ fmt, args);
++        return L.ck.get(L.name);
++    }
++
++    fn expect(L: *Loader, comptime fmt: []const u8, args: anytype, dtype: core.checkpoint.DType, dims: []const usize) !Tensor {
++        const t = try L.get(fmt, args);
++        if (!t.is(dtype, dims)) {
++            std.log.err("inkling2: {s} is not {s}{any}", .{ L.name, @tagName(dtype), dims });
++            return error.UnexpectedInkling2Tensor;
++        }
++        return t;
++    }
++
++    fn put(L: *Loader, bytes: []const u8) !u64 {
++        return L.sink.put(L.sink.ctx, bytes);
++    }
++
++    /// Rows [lo, hi) of a stored row-major tensor whose rows are `row_bytes` long.
++    fn rows(L: *Loader, t: Tensor, lo: usize, hi: usize) !u64 {
++        const rb = t.bytes.len / t.dim(0);
++        return L.put(t.bytes[lo * rb .. hi * rb]);
++    }
++
++    /// Columns [lo, hi) of every row of a stored 2-D bf16 tensor.
++    fn cols(L: *Loader, t: Tensor, lo: usize, hi: usize) !u64 {
++        const n = t.dim(1);
++        var out: std.ArrayList(u8) = .empty;
++        defer out.deinit(L.gpa);
++        for (0..t.dim(0)) |r| try out.appendSlice(L.gpa, t.bytes[2 * (r * n + lo) .. 2 * (r * n + hi)]);
++        return L.put(out.items);
++    }
++
++    fn lin(L: *Loader, i: u32, name: []const u8, n: usize, k: usize, c: exl3.Cut) !Linear {
++        var b: [128]u8 = undefined;
++        return exl3.linear(L.gpa, L.ck, L.sink, try std.fmt.bufPrint(&b, prefix ++ "layers.{d}.attn.{s}", .{ i, name }), n, k, c);
++    }
++
++    fn attention(L: *Loader, i: u32) !Attention {
++        const c = &L.w.config;
++        const s = L.w.share;
++        const h: usize = c.hidden;
++        const D: usize = c.head_dim;
++        const H: usize = c.heads;
++        const KV: usize = c.kv_heads;
++        const q: shard.Span = .{ .lo = s.heads.lo * D, .hi = s.heads.hi * D };
++        const kv: shard.Span = .{ .lo = s.kv.lo * D, .hi = s.kv.hi * D };
++        const rel: shard.Span = .{ .lo = s.heads.lo * c.d_rel, .hi = s.heads.hi * c.d_rel };
++        var a: Attention = .{
++            .q = try L.lin(i, "wq_du", H * D, h, .{ .cols = q }),
++            .k = try L.lin(i, "wk_dv", KV * D, h, .{ .cols = kv }),
++            .v = try L.lin(i, "wv_dv", KV * D, h, .{ .cols = kv }),
++            .r = try L.lin(i, "wr_du", H * c.d_rel, h, if (s.whole()) .whole else .{ .cols = rel }),
++            .gate = try L.lin(i, "gate_attn", H * D, h, .{ .cols = q }),
++            .o = try L.lin(i, "wo_ud", h, H * D, .{ .rows = q }),
++            .sink = try L.rows(try L.expect("layers.{d}.attn.attn_sink_proj.weight", .{i}, .bf16, &.{ H, h }), s.heads.lo, s.heads.hi),
++            .q_scale = try L.rows(try L.expect("layers.{d}.attn.q_l2_clip.scale", .{i}, .bf16, &.{ H, D }), s.heads.lo, s.heads.hi),
++            .rel_scale = try L.rows(try L.expect("layers.{d}.attn.rel_l2_clip.scale", .{i}, .bf16, &.{ H, c.d_rel }), s.heads.lo, s.heads.hi),
++            .rel_proj = try L.rows(try L.expect("layers.{d}.attn.rel_logits_proj.proj", .{i}, .bf16, &.{ c.d_rel, c.rel_extent }), 0, c.d_rel),
++            .k_conv = 0,
++            .v_conv = 0,
++        };
++        if (c.layer[i] == .sliding) {
++            a.k_conv = try L.rows(try L.expect("layers.{d}.attn.k_sconv.weight", .{i}, .bf16, &.{ KV * D, 1, c.conv }), kv.lo, kv.hi);
++            a.v_conv = try L.rows(try L.expect("layers.{d}.attn.v_sconv.weight", .{i}, .bf16, &.{ KV * D, 1, c.conv }), kv.lo, kv.hi);
++        } else {
++            a.k_conv = try L.cols(try L.expect("layers.{d}.attn.k_sconv.static_w", .{i}, .bf16, &.{ c.conv, KV * D }), kv.lo, kv.hi);
++            a.v_conv = try L.cols(try L.expect("layers.{d}.attn.v_sconv.static_w", .{i}, .bf16, &.{ c.conv, KV * D }), kv.lo, kv.hi);
++            const t0 = s.kv.lo * c.conv;
++            const t1 = s.kv.hi * c.conv;
++            a.k_proj = try L.rows(try L.expect("layers.{d}.attn.k_sconv.weight_proj", .{i}, .bf16, &.{ KV * c.conv, h }), t0, t1);
++            a.v_proj = try L.rows(try L.expect("layers.{d}.attn.v_sconv.weight_proj", .{i}, .bf16, &.{ KV * c.conv, h }), t0, t1);
++        }
++        return a;
++    }
++
++    fn vector(L: *Loader, comptime fmt: []const u8, args: anytype, dtype: core.checkpoint.DType, n: usize) !u64 {
++        return L.put((try L.expect(fmt, args, dtype, &.{n})).bytes);
++    }
++
++    fn layer(L: *Loader, i: u32) !Layer {
++        const c = &L.w.config;
++        const h: usize = c.hidden;
++        const global = c.layer[i] == .global;
++        var l: Layer = undefined;
++        l.kind = c.layer[i];
++        l.norms = @splat(0);
++        if (global) {
++            for ([_][]const u8{ "q", "k", "v" }, 0..) |n, j| l.norms[j] = try L.vector("layers.{d}.{s}_input_norm.weight", .{ i, n }, .bf16, h);
++        } else l.norms[0] = try L.vector("layers.{d}.attn_norm.weight", .{i}, .bf16, h);
++        l.nq = if (global) 3 else 1;
++        l.attn_query = 0;
++        if (i > 0) {
++            const t = try L.get("attn_res.attn_queries.{d}", .{i - 1});
++            if (t.dtype != .f32 or t.numel() != l.nq * h) return error.UnexpectedInkling2Tensor;
++            l.attn_query = try L.put(t.bytes);
++        }
++        l.mlp_query = try L.vector("attn_res.mlp_queries.{d}", .{i}, .f32, h);
++        l.mlp_norm = try L.vector("layers.{d}.mlp_norm.weight", .{i}, .bf16, h);
++        l.attn_conv = try L.put((try L.expect("layers.{d}.attn_sconv.weight", .{i}, .bf16, &.{ h, 1, c.conv })).bytes);
++        l.mlp_conv = try L.put((try L.expect("layers.{d}.mlp_sconv.weight", .{i}, .bf16, &.{ h, 1, c.conv })).bytes);
++        l.attn = try L.attention(i);
++        l.router = try L.put((try L.expect("layers.{d}.mlp.gate.weight", .{i}, .bf16, &.{ c.experts, h })).bytes);
++        l.bias = try L.vector("layers.{d}.mlp.gate.bias", .{i}, .f32, c.experts);
++        l.experts = try exl3.experts(L.gpa, L.ck, L.sink, prefix, i, c.experts, h, c.intermediate, L.w.share.inter);
++        return l;
++    }
++};
++
++/// The rank's weights of `layers` (a prefix for a truncated pack), the embedding whole, its vocabulary's head rows.
++pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dense: *cuda.exl3.Dense, stream: cuda.Stream, dir: []const u8, c: cfg.Config, rank: usize, world: usize) !Weights {
++    var ck = try core.Checkpoint.openModel(gpa, io, dir);
++    defer core.checkpoint.cache.close(&ck);
++    const head_svh = try ck.get(prefix ++ "unembed.svh");
++    const padded = head_svh.dim(0);
++    if (padded < c.vocab or padded % 128 != 0) return error.UnexpectedInkling2Tensor;
++    var w: Weights = .{ .gpa = gpa, .d = d, .config = c, .share = try shard.Share.of(&c, padded, rank, world), .padded_vocab = padded };
++    errdefer w.deinit();
++    var L: Loader = .{ .gpa = gpa, .w = &w, .ck = &ck, .sink = .{ .ctx = &w, .put = Weights.put, .dense = dense, .stream = stream } };
++    w.layers = try gpa.alloc(Layer, c.layers);
++    for (w.layers, 0..) |*l, i| {
++        l.* = try L.layer(@intCast(i));
++        ck.release(); // the pages read so far, before they crowd the device's allocations
++    }
++    w.embed = try L.put((try L.expect("embed.weight", .{}, .bf16, &.{ c.vocab, c.hidden })).bytes);
++    w.embed_norm = try L.vector("embed_norm.weight", .{}, .bf16, c.hidden);
++    w.norm = try L.vector("norm.weight", .{}, .bf16, c.hidden);
++    w.out_query = try L.vector("attn_res.output_query", .{}, .f32, c.hidden);
++    const v = w.share.vocab;
++    w.head = try exl3.linear(gpa, &ck, L.sink, prefix ++ "unembed", padded, c.hidden, if (w.share.whole()) .whole else .{ .cols = v });
++    try stream.synchronize();
++    return w;
++}

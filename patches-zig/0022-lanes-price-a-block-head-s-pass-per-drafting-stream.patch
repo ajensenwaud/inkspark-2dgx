@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 23:04:17 +1100
+Subject: [PATCH 22/45] lanes: price a block head's pass per drafting stream
+
+A DSpark block costs one pass whatever its depth, and Inkling 2 runs
+those passes a stream at a time. Shared rounds priced drafts by depth
+past each stream's first, so every stream's first draft looked free and
+four or eight streams kept drafting at ~16 ms a stream for ~0.5 tokens.
+With draft_passes set, the allocator charges draft_step_ms once a
+drafting stream, and the measured overhead leaves those passes out.
+---
+ zig/src/core/lanes/allocate.zig         |  14 ++-
+ zig/src/core/lanes/config.zig           |   3 +
+ zig/src/core/lanes/depth.zig            |  42 +++------
+ zig/src/core/lanes/engine.zig           |   7 +-
+ zig/src/core/lanes/lanes.zig            |   1 +
+ zig/src/core/lanes/shared_pass_test.zig | 111 ++++++++++++++++++++++++
+ zig/src/families/inkling2/lanes.zig     |   7 +-
+ 7 files changed, 146 insertions(+), 39 deletions(-)
+ create mode 100644 zig/src/core/lanes/shared_pass_test.zig
+
+diff --git a/zig/src/core/lanes/allocate.zig b/zig/src/core/lanes/allocate.zig
+index 99426b5..45ea18d 100644
+--- a/zig/src/core/lanes/allocate.zig
++++ b/zig/src/core/lanes/allocate.zig
+@@ -21,6 +21,7 @@ pub const HeadCost = struct {
+     step_ms: f64 = 0.0,
+     batched: bool = false,
+     free_first: bool = false,
++    passes: bool = false, // step_ms is each drafting stream's whole pass (a block head run stream by stream)
+     row_ms: f64 = 0.0, // what each row past a stream's first costs past the table on this machine (below it: less)
+     least_rows: u64 = 0, // a measuring round reaches this many rows, the likeliest nodes first, whatever they cost
+ };
+@@ -67,7 +68,7 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
+         drafts += 1;
+         deepest = @max(deepest, counts[s]);
+         expected += pick_p;
+-        const steps: f64 = @floatFromInt(if (head.batched) deepest -| @intFromBool(head.free_first) else drafts - (if (head.free_first) firsts else 0));
++        const steps: f64 = @floatFromInt(if (head.passes) firsts else if (head.batched) deepest -| @intFromBool(head.free_first) else drafts - (if (head.free_first) firsts else 0));
+         if (rows < least) continue;
+         const now = rate(costs, timed, rows, expected, overhead_ms + head.step_ms * steps + rowTerm(costs, timed, head, rows, live));
+         if (now > best or (!timed and head.step_ms == 0)) {
+@@ -198,6 +199,17 @@ test "a priced draft step cuts the stream whose later drafts land seldom and kee
+     try std.testing.expectEqualSlices(u32, &.{ 3, 3 }, free);
+ }
+ 
++test "a pass a drafting stream prices streams, not depth: deep drafts pay where one more stream does not" {
++    const gpa = std.testing.allocator;
++    var flat = try extendCosts(gpa, &.{ .{ .width = 1, .ms = 10.0 }, .{ .width = 16, .ms = 10.0 } }, 16);
++    defer flat.deinit(gpa);
++    const probs = [_][]const f64{ &.{ 0.9, 0.85, 0.8, 0.75 }, &.{ 0.3, 0.1, 0.05, 0.01 } };
++    // a 10 ms pass: the first stream's four drafts pay it once, the second's 0.46 tokens do not
++    const counts = try allocateDrafts(gpa, &.{ 1, 1 }, &probs, &flat, 0.0, 16, .{ .step_ms = 10.0, .batched = true, .free_first = true, .passes = true });
++    defer gpa.free(counts);
++    try std.testing.expectEqualSlices(u32, &.{ 4, 0 }, counts);
++}
++
+ test "a zero draft step prices rounds as allocate does" {
+     const gpa = std.testing.allocator;
+     var costs = try extendCosts(gpa, &.{ .{ .width = 1, .ms = 10.0 }, .{ .width = 8, .ms = 12.0 } }, 8);
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index a9af579..ae7af03 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -36,6 +36,7 @@ pub const Model = struct {
+     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
+     shared_step_ms: ?f64 = null, // a separate shared head step; null keeps mtp_step_ms
+     draft_step_ms: f64 = 0.0, // a shared round's draft past a stream's first, as the backend's head runs it (0: priced free)
++    draft_passes: bool = false, // draft_step_ms is each drafting stream's whole pass in a shared round, whatever its depth
+     streams_exact: bool = true, // shared forwards keep each stream's bits
+     hidden_rows: bool = false, // the backend runs several streams' windows in one forward
+     batch_rows: u32 = 0, // a shared forward's rows at most (0: 32)
+@@ -102,6 +103,7 @@ pub const Config = struct {
+     lane_costs: Table, // window ms by rows to 64 (lanes/plan_lanes.zig)
+     mtp_step_ms: f64,
+     draft_step_ms: f64 = 0, // Model.draft_step_ms
++    draft_passes: bool = false, // Model.draft_passes
+     shared_drafts: u32 = 0, // Model.shared_drafts
+     lone_cost_tile: u32 = 0, // Model.lone_cost_tile
+     context_copies: bool = false, // Model.context_copies, within the existing verification width
+@@ -188,6 +190,7 @@ pub const Config = struct {
+                 .hold_costs = m.hold_costs,
+             },
+             .draft_step_ms = m.draft_step_ms,
++            .draft_passes = m.draft_passes,
+             .shared_drafts = m.shared_drafts,
+         };
+     }
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index c5bd764..852d906 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -55,6 +55,7 @@ pub const Rule = struct {
+     shared_costs: *const Table,
+     mtp_step_ms: f64,
+     draft_step_ms: f64 = 0, // a shared round's draft past a stream's first (budgets price it)
++    draft_passes: bool = false, // draft_step_ms is each drafting stream's whole pass, whatever its depth
+     plain_guard: bool,
+     node_probabilities: bool,
+     granted_depth: bool = false, // node_probabilities: a stream drafts its last grant plus draft_slack, lone ones too
+@@ -328,7 +329,7 @@ pub const Rule = struct {
+         @memset(ones, 1);
+         const head: alloc.HeadCost = .{ .step_ms = r.sharedStepMs(), .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled), .least_rows = r.row_cost.leastRows(whos.len, sampled) };
+         const counts = if (r.draft_step_ms != 0)
+-            try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled), .least_rows = head.least_rows })
++            try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .passes = r.draft_passes, .row_ms = r.row_cost.extraMs(whos.len, sampled), .least_rows = head.least_rows })
+         else
+             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), head);
+         defer r.gpa.free(counts);
+@@ -393,13 +394,21 @@ pub const Rule = struct {
+         return r.k.shared_step_ms orelse r.mtp_step_ms;
+     }
+ 
+-    /// The modeled time of a shared round's head steps for the depths it drafted.
++    /// The modeled time of a shared round's head steps for the depths it drafted (passes: priced whole, none left).
+     pub fn headMs(r: *const Rule, depths: []const i64) f64 {
++        if (r.draft_passes) return 0;
+         var steps: i64 = 0;
+         for (depths) |d| steps = if (r.batched_heads) @max(steps, d) else steps + d;
+         return r.sharedStepMs() * @as(f64, @floatFromInt(steps));
+     }
+ 
++    /// The draft ms a shared round's budgets priced at draft_step_ms, which its measured overhead leaves out.
++    pub fn pricedDraftMs(r: *const Rule, depths: []const i64) f64 {
++        var steps: i64 = 0;
++        for (depths) |d| steps = if (r.draft_passes) steps + @intFromBool(d > 0) else if (r.batched_heads and pricedBatched()) @max(steps, d - 1) else steps + @max(0, d - 1);
++        return r.draft_step_ms * @as(f64, @floatFromInt(steps));
++    }
++
+     /// `sampled`: the round drew keyed samples, so it counts for sampled streams' overhead alone; `head_ms` its drafts.
+     pub fn observeOverhead(r: *Rule, streams: u32, rows: u64, ms: f64, sampled: bool, head_ms: f64) !void {
+         const forward = r.shared_costs.get(@intCast(rows)) orelse return;
+@@ -479,35 +488,6 @@ test "under a confidence floor a greedy stream drafts the most, and a sampled on
+     try std.testing.expectEqual(@as(i64, 1), try rule.headDepth(&sampled, null, probe)); // a first rate under 0.8: one draft
+ }
+ 
+-test "a shared round's drafts come out the same whichever depths its overhead was measured at" {
+-    const gpa = std.testing.allocator;
+-    var shared: Table = .{};
+-    defer shared.deinit(gpa);
+-    for (1..17) |w| try shared.put(gpa, @intCast(w), 10.0 + 2.0 * @as(f64, @floatFromInt(w)));
+-    const empty: Table = .{};
+-    const No = struct {
+-        fn copy(_: *anyopaque, _: *const Who) bool {
+-            return false;
+-        }
+-    };
+-    var unused: u8 = 0;
+-    const probe: Probe = .{ .ptr = &unused, .copy = No.copy };
+-    var got: [2][2]i64 = undefined;
+-    for ([_][2]i64{ .{ 1, 1 }, .{ 3, 3 } }, &got) |measured, *out| {
+-        var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.8, 0.7, 0.6 }, .most_drafts = 4, .family_costs = &empty, .shared_costs = &shared, .mtp_step_ms = 3.0, .plain_guard = false, .node_probabilities = false, .batch_rows = 16 };
+-        defer rule.deinit();
+-        // two streams' round: their pending rows and the drafts verified, 3 ms of its own, then each drafted step
+-        const rows: u64 = @intCast(2 + measured[0] + measured[1]);
+-        const head = rule.headMs(&measured);
+-        try rule.observeOverhead(2, rows, shared.get(@intCast(rows)).? + 3.0 + head, false, head);
+-        var states: [2]?State = .{ null, null };
+-        defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
+-        var whos = [_]Who{ .{ .state = &states[0], .draft_room = 100, .finished = false, .forced = false }, .{ .state = &states[1], .draft_room = 100, .finished = false, .forced = false } };
+-        try rule.budgets(&whos, probe, false, out);
+-    }
+-    try std.testing.expectEqualSlices(i64, &got[0], &got[1]);
+-}
+-
+ test "granted depths in a shared round fit one hold pass: every block is as deep as the deepest" {
+     const empty: Table = .{};
+     var rule: Rule = .{ .gpa = std.testing.allocator, .prior = &.{0.8}, .most_drafts = 9, .family_costs = &empty, .shared_costs = &empty, .mtp_step_ms = 0.5, .plain_guard = false, .node_probabilities = true, .granted_depth = true, .batch_rows = 32 };
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 018ae4a..b7aa498 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -70,6 +70,7 @@ pub const Engine = struct {
+                 .shared_costs = &cfg.shared_costs,
+                 .mtp_step_ms = cfg.mtp_step_ms,
+                 .draft_step_ms = cfg.draft_step_ms,
++                .draft_passes = cfg.draft_passes,
+                 .plain_guard = cfg.plain_guard,
+                 .node_probabilities = cfg.node_probabilities,
+                 .granted_depth = cfg.granted_depth,
+@@ -314,10 +315,8 @@ pub const Engine = struct {
+         };
+         try e.backend.keep(windows, paths);
+         if (e.cfg.timed) {
+-            // the drafts budgets priced past each stream's first are no part of the round's overhead
+-            var steps: i64 = 0;
+-            for (budgets) |d| steps = if (e.cfg.draft_streams and depth.pricedBatched()) @max(steps, d - 1) else steps + @max(0, d - 1);
+-            const ms = e.clock.elapsedMs(.overhead) - e.cfg.draft_step_ms * @as(f64, @floatFromInt(steps));
++            // the drafts budgets priced (past each stream's first, or whole passes) are no part of the round's overhead
++            const ms = e.clock.elapsedMs(.overhead) - e.rule.pricedDraftMs(budgets);
+             try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
+             try e.rule.observeOverhead(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets));
+         }
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 75ebc70..b46bfa9 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -79,6 +79,7 @@ test {
+     _ = @import("grammar_time_test.zig");
+     _ = @import("grammar_parallel_test.zig");
+     _ = @import("pricing_test.zig");
++    _ = @import("shared_pass_test.zig");
+     _ = @import("depth_probe_test.zig");
+     _ = @import("proposal_external_test.zig");
+     _ = @import("lone_costs_test.zig");
+diff --git a/zig/src/core/lanes/shared_pass_test.zig b/zig/src/core/lanes/shared_pass_test.zig
+new file mode 100644
+index 0000000..883d587
+--- /dev/null
++++ b/zig/src/core/lanes/shared_pass_test.zig
+@@ -0,0 +1,111 @@
++//! Shared rounds' draft prices: a measured overhead's head steps, and a block head that runs a pass a stream.
++const std = @import("std");
++const depth = @import("depth.zig");
++const alloc = @import("allocate.zig");
++const Table = @import("table.zig").Table;
++const Cost = alloc.Cost;
++const Rule = depth.Rule;
++const State = depth.State;
++const Who = depth.Who;
++const Probe = depth.Probe;
++
++const No = struct {
++    fn copy(_: *anyopaque, _: *const Who) bool {
++        return false;
++    }
++};
++var unused: u8 = 0;
++const probe: Probe = .{ .ptr = &unused, .copy = No.copy };
++
++test "a shared round's drafts come out the same whichever depths its overhead was measured at" {
++    const gpa = std.testing.allocator;
++    var shared: Table = .{};
++    defer shared.deinit(gpa);
++    for (1..17) |w| try shared.put(gpa, @intCast(w), 10.0 + 2.0 * @as(f64, @floatFromInt(w)));
++    const empty: Table = .{};
++    var got: [2][2]i64 = undefined;
++    for ([_][2]i64{ .{ 1, 1 }, .{ 3, 3 } }, &got) |measured, *out| {
++        var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.8, 0.7, 0.6 }, .most_drafts = 4, .family_costs = &empty, .shared_costs = &shared, .mtp_step_ms = 3.0, .plain_guard = false, .node_probabilities = false, .batch_rows = 16 };
++        defer rule.deinit();
++        // two streams' round: their pending rows and the drafts verified, 3 ms of its own, then each drafted step
++        const rows: u64 = @intCast(2 + measured[0] + measured[1]);
++        const head = rule.headMs(&measured);
++        try rule.observeOverhead(2, rows, shared.get(@intCast(rows)).? + 3.0 + head, false, head);
++        var states: [2]?State = .{ null, null };
++        defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
++        var whos = [_]Who{ .{ .state = &states[0], .draft_room = 100, .finished = false, .forced = false }, .{ .state = &states[1], .draft_room = 100, .finished = false, .forced = false } };
++        try rule.budgets(&whos, probe, false, out);
++    }
++    try std.testing.expectEqualSlices(i64, &got[0], &got[1]);
++}
++
++/// Inkling 2 on two GB10s (tf-inkling2-engine timing): shared forwards by total rows, a lone window by rows.
++const shared_ms = [_]Cost{
++    .{ .width = 1, .ms = 31.8 },  .{ .width = 2, .ms = 41.3 },   .{ .width = 4, .ms = 61.8 },   .{ .width = 8, .ms = 81.4 },
++    .{ .width = 16, .ms = 120.6 }, .{ .width = 32, .ms = 182.3 }, .{ .width = 64, .ms = 223.4 },
++};
++const lone_ms = [_]f64{ 31.8, 38.7, 45.1, 52.0, 56.6, 61.0, 66.9, 69.8 };
++const prose = [_]f64{ 0.7, 0.55, 0.5 };
++const code = [_]f64{0.95};
++
++fn inkRule(costs: *const Table, lone: *const Table, rates: []const f64, passes: bool) Rule {
++    return .{ .gpa = std.testing.allocator, .prior = rates, .most_drafts = 7, .family_costs = lone, .shared_costs = costs, .mtp_step_ms = 16.4 / 7.0, .draft_step_ms = if (passes) 15.9 else 15.8, .draft_passes = passes, .plain_guard = true, .node_probabilities = false, .batch_rows = 64, .batched_heads = true };
++}
++
++/// The first shared round's budgets for `streams` streams drafting at `rates` (no overhead measured yet: 8 ms).
++fn budgets(rates: []const f64, streams: usize, passes: bool) ![8]i64 {
++    const gpa = std.testing.allocator;
++    var costs = try alloc.extendCosts(gpa, &shared_ms, 64);
++    defer costs.deinit(gpa);
++    const empty: Table = .{};
++    var rule = inkRule(&costs, &empty, rates, passes);
++    defer rule.deinit();
++    var states: [8]?State = @splat(null);
++    defer for (&states) |*s| if (s.*) |*x| x.deinit(gpa);
++    var whos: [8]Who = undefined;
++    for (&whos, &states) |*w, *s| w.* = .{ .state = s, .draft_room = 100, .finished = false, .forced = false };
++    var out: [8]i64 = @splat(0);
++    try rule.budgets(whos[0..streams], probe, false, out[0..streams]);
++    return out;
++}
++
++test "a block head's pass a drafting stream: shared rounds go plain where it does not pay, a lone stream drafts" {
++    const t = std.testing;
++    const none: [8]i64 = @splat(0);
++    // prose rates: every stream's ~16 ms pass costs more than its ~1.2 drafts save, at 4 streams and at 8
++    try t.expectEqualSlices(i64, &none, &try budgets(&prose, 4, true));
++    try t.expectEqualSlices(i64, &none, &try budgets(&prose, 8, true));
++    // priced by depth past each stream's first draft, a first draft for every stream looked free
++    var old: i64 = 0;
++    for (try budgets(&prose, 4, false)) |d| old += d;
++    try t.expect(old > 0);
++    // code rates: the passes pay, every stream drafts
++    for ((try budgets(&code, 4, true))[0..4]) |d| try t.expect(d > 0);
++    // a lone stream's rounds keep their own rule: prose still drafts against a 31.8 ms plain window
++    var costs = try alloc.extendCosts(t.allocator, &shared_ms, 64);
++    defer costs.deinit(t.allocator);
++    var lone: Table = .{};
++    defer lone.deinit(t.allocator);
++    for (lone_ms, 1..) |ms, w| try lone.put(t.allocator, @intCast(w), ms);
++    var rule = inkRule(&costs, &lone, &prose, true);
++    defer rule.deinit();
++    var st: ?State = null;
++    defer if (st) |*s| s.deinit(t.allocator);
++    try t.expect(try rule.depth(.{ .state = &st, .draft_room = 100, .finished = false, .forced = false }) > 0);
++}
++
++test "a shared round's measured overhead leaves out the passes its budgets priced" {
++    const t = std.testing;
++    var costs = try alloc.extendCosts(t.allocator, &shared_ms, 64);
++    defer costs.deinit(t.allocator);
++    const empty: Table = .{};
++    var rule = inkRule(&costs, &empty, &prose, true);
++    defer rule.deinit();
++    // four streams, two of them drafting (3 and 1 drafts): two passes whatever their depth, 5 ms of the round's own
++    const depths = [_]i64{ 3, 0, 1, 0 };
++    try t.expectApproxEqAbs(@as(f64, 2 * 15.9), rule.pricedDraftMs(&depths), 1e-9);
++    try t.expectEqual(@as(f64, 0), rule.headMs(&depths));
++    const elapsed = costs.get(8).? + 5.0 + 2 * 15.9;
++    try rule.observeOverhead(4, 8, elapsed - rule.pricedDraftMs(&depths), false, rule.headMs(&depths));
++    try t.expectApproxEqAbs(@as(f64, 5.0), rule.overheadMs(4, false), 1e-9);
++}
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 132963e..687f769 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -12,12 +12,12 @@ const be = lanes.backend;
+ const ring = 1024;
+ pub const max_rows = engine.window_rows;
+ 
+-/// Forward ms on the inkspark-2dgx pack at TP=2 (tf-inkling2-engine timing, medians of 16): a lone window by rows,
+-/// then shared forwards by total rows, taking the dearer split where streams x rows differ (interpolated between).
++/// Forward ms on the inkspark-2dgx pack at TP=2 (tf-inkling2-engine timing, medians of 16): a lone window by rows.
+ const gb10_window_costs = [_]lanes.config.Cost{
+     .{ .width = 1, .ms = 31.8 }, .{ .width = 2, .ms = 38.7 }, .{ .width = 3, .ms = 45.1 }, .{ .width = 4, .ms = 52.0 },
+     .{ .width = 5, .ms = 56.6 }, .{ .width = 6, .ms = 61.0 }, .{ .width = 7, .ms = 66.9 }, .{ .width = 8, .ms = 69.8 },
+ };
++/// Shared forwards by total rows, the dearer split where streams x rows differ (interpolated between).
+ const gb10_shared_costs = [_]lanes.config.Cost{
+     .{ .width = 1, .ms = 31.8 },   .{ .width = 2, .ms = 41.3 },   .{ .width = 4, .ms = 61.8 },
+     .{ .width = 8, .ms = 81.4 },   .{ .width = 16, .ms = 120.6 }, .{ .width = 32, .ms = 182.3 },
+@@ -81,7 +81,8 @@ pub const Lanes = struct {
+             .drafts = if (head) max_held else 0,
+             .draft_streams = head,
+             .mtp_step_ms = if (head) 16.4 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (16.4 ms timed)
+-            .draft_step_ms = if (head) 15.8 else 0, // each further stream's block runs as its own pass (timed)
++            .draft_step_ms = if (head) 15.9 else 0, // a shared round's block pass, a stream at a time (127.1 ms for 8)
++            .draft_passes = head, // whatever the depth: a stream's 1 draft costs the pass its 7 do
+             .plain_guard = head, // plain rounds compete: one-row forwards are cheap next to a draft pass
+             .window_costs = if (head) &gb10_window_costs else &.{},
+             .window_costs_lone = true,

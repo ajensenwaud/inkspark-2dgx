@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 02:15:04 +1100
+Subject: [PATCH 28/45] inkling2: the residual mix issues a column's loads
+ together
+
+The first rewrite still read a row's blocks one load after another, each
+behind the branch that ends the block loop, and ran slower (46 vs 39 us).
+A column's loads are now predicated with no branch between them, so they
+overlap; the sums add the same values in the same order as before.
+---
+ zig/kernels/cuda/inkling2/ops.cu  | 48 ++++++++++++++++++-------------
+ zig/src/families/inkling2/ops.zig |  2 +-
+ 2 files changed, 29 insertions(+), 21 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index 0aad40d..dec2792 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -10,7 +10,7 @@ namespace ink2o {
+ constexpr int kMaxBlocks = 8;
+ constexpr int kMaxQueries = 3;
+ constexpr int kConvTaps = 4;
+-constexpr int kMixCache = 16;  // tf_ink2_mix holds a row of up to kMixCache x blockDim columns in registers
++constexpr int kMixCache = 10;  // tf_ink2_mix holds a row of up to kMixCache x blockDim columns in registers
+ 
+ __device__ __forceinline__ float bf(uint16_t u) { return __uint_as_float(static_cast<uint32_t>(u) << 16); }
+ 
+@@ -67,6 +67,16 @@ struct MixArgs {
+     float eps;
+ };
+ 
++// Column `at` of every block and the partial: predicated loads with no branch between them, so they overlap.
++__device__ __forceinline__ void mixColumn(const MixArgs& a, size_t at, float (&x)[kMaxBlocks + 1]) {
++#pragma unroll
++    for (int j = 0; j < kMaxBlocks; ++j) x[j] = j < a.n_blocks ? bf(__ldg(a.blocks[j] + at)) : 0.0f;
++    const float p = a.partial_bf16 ? bf(static_cast<const uint16_t*>(a.partial)[at]) : static_cast<const float*>(a.partial)[at];
++#pragma unroll
++    for (int j = 0; j <= kMaxBlocks; ++j)
++        if (j == a.n_blocks) x[j] = p;
++}
++
+ extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix(const MixArgs a) {
+     constexpr int kV = (kMaxBlocks + 1) * (1 + kMaxQueries);
+     __shared__ float sh[32 * kV];
+@@ -74,27 +84,25 @@ extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix(const MixArgs a) {
+     __shared__ float rr[kMaxBlocks + 1];
+     const size_t row = blockIdx.x;
+     const int C = a.C, n = a.n_blocks + 1;
+-    auto entry = [&](int j, int c) -> float {
+-        if (j < a.n_blocks) return bf(a.blocks[j][row * C + c]);
+-        return a.partial_bf16 ? bf(static_cast<const uint16_t*>(a.partial)[row * C + c])
+-                              : static_cast<const float*>(a.partial)[row * C + c];
+-    };
++    float x[kMaxBlocks + 1];
+     if (a.query) {
+         // every block's sums in one pass and one reduction: each sum adds in the order it did block by block
+         float v[kV];
++#pragma unroll
+         for (int i = 0; i < kV; ++i) v[i] = 0.0f;
+         for (int c = threadIdx.x; c < C; c += blockDim.x) {
+             float qc[kMaxQueries];
+ #pragma unroll
+             for (int q = 0; q < kMaxQueries; ++q) qc[q] = q < a.nq ? a.query[static_cast<size_t>(q) * C + c] : 0.0f;
++            mixColumn(a, row * C + c, x);
+ #pragma unroll
+             for (int j = 0; j < kMaxBlocks + 1; ++j) {
+-                if (j >= n) break;
+-                const float x = entry(j, c);
+-                v[j * (1 + kMaxQueries)] += x * x;
++                if (j < n) {
++                    v[j * (1 + kMaxQueries)] += x[j] * x[j];
+ #pragma unroll
+-                for (int q = 0; q < kMaxQueries; ++q)
+-                    if (q < a.nq) v[j * (1 + kMaxQueries) + 1 + q] += x * qc[q];
++                    for (int q = 0; q < kMaxQueries; ++q)
++                        if (q < a.nq) v[j * (1 + kMaxQueries) + 1 + q] += x[j] * qc[q];
++                }
+             }
+         }
+         blockSums<kV>(v, sh);
+@@ -122,17 +130,17 @@ extern "C" __global__ void __launch_bounds__(512) tf_ink2_mix(const MixArgs a) {
+     for (int k = 0; k < kMixCache; ++k) {
+         const int c = threadIdx.x + k * blockDim.x;
+         float h[kMaxQueries] = {0.0f, 0.0f, 0.0f};
+-        if (c < C) {
+-            if (a.query) {
+-                for (int j = 0; j < n; ++j) {
+-                    const float x = entry(j, c);
++        if (c < C && a.query) {
++            mixColumn(a, row * C + c, x);
++#pragma unroll
++            for (int j = 0; j < kMaxBlocks + 1; ++j)
++                if (j < n)
+ #pragma unroll
+                     for (int q = 0; q < kMaxQueries; ++q)
+-                        if (q < a.nq) h[q] += wts[q][j] * (x * rr[j]);
+-                }
+-            } else {
+-                h[0] = entry(a.n_blocks, c);
+-            }
++                        if (q < a.nq) h[q] += wts[q][j] * (x[j] * rr[j]);
++        } else if (c < C) {
++            const size_t at = row * C + c;
++            h[0] = a.partial_bf16 ? bf(static_cast<const uint16_t*>(a.partial)[at]) : static_cast<const float*>(a.partial)[at];
+         }
+ #pragma unroll
+         for (int q = 0; q < kMaxQueries; ++q) {
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index b06c56a..59655ca 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -119,7 +119,7 @@ pub fn embed(k: *const Kernels, s: cuda.Stream, ids: u64, rows: usize, table: u6
+ 
+ /// The residual mix of each row and query, normed: a block a row.
+ pub fn mix(k: *const Kernels, s: cuda.Stream, m: MixArgs) !void {
+-    if (m.c > 16 * 512) return error.Inkling2MixWidth; // ops.cu kMixCache rows of 512 columns
++    if (m.c > 10 * 512) return error.Inkling2MixWidth; // ops.cu kMixCache rows of 512 columns
+     var a: cuda.Args = .{};
+     a.add(m);
+     try go(k.mix, s, .{ .x = @intCast(m.rows) }, 512, &a);

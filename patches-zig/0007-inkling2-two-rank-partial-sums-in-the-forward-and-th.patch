@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:16:06 +1100
+Subject: [PATCH 07/45] inkling2: two-rank partial sums in the forward and the
+ dump tool
+
+After o_proj and after the experts each rank holds a partial of the
+residual update. At two ranks the forward gathers them over NCCL and the
+residual conv kernel adds them in rank order before its taps, so both
+ranks see the same sum; at one rank the conv reads its buffer as before
+(one-GPU logits byte-identical to the previous build). tf-inkling2-cuda
+opens the communicator from TF_INKLING2_RANK, TF_INKLING2_WORLD and
+NCCL_COMM_ID and writes each rank's vocabulary rows.
+---
+ zig/kernels/cuda/inkling2/ops.cu        |  6 ++--
+ zig/src/families/inkling2/dump_main.zig | 30 +++++++++++++----
+ zig/src/families/inkling2/forward.zig   | 44 ++++++++++++++++++++++---
+ zig/src/families/inkling2/ops.zig       |  4 ++-
+ 4 files changed, 71 insertions(+), 13 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index bbb1379..eac0d87 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -246,14 +246,15 @@ extern "C" __global__ void tf_ink2_gateup(const GateUpArgs a) {
+ 
+ // Short causal conv over a stream's rows (4 taps, last 3 inputs in `state`): static [C][4] or dynamic [4][C] + dyn.
+ struct ConvArgs {
+-    const void* x;          // [rows, C]: fp32, or bf16 when x_bf16
++    const void* x;          // [rows, C]: fp32 (`parts` rank partials, part_stride apart, added in rank order) or bf16
+     float* state;           // fp32 [3, C], oldest first
+     const uint16_t* w;      // bf16 taps
+     const float* dyn;       // fp32 [rows, heads * 4] or null
+     const uint16_t* base;   // bf16 [rows, C] (mode 1, null: zero)
+     float* resid;           // fp32 [rows, C] (modes 1 and 2)
+     uint16_t* out;          // bf16 [rows, C] (modes 0 and 2)
+-    int x_bf16, round_in, heads, C, rows, mode;  // mode 0: out = y; 1: resid = base + bf16(y); 2: out = resid + bf16(y)
++    long long part_stride;
++    int parts, x_bf16, round_in, heads, C, rows, mode;  // mode 0: out = y; 1: resid = base + bf16(y); 2: resid + bf16(y)
+ };
+ 
+ extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv(const ConvArgs a) {
+@@ -265,6 +266,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv(const ConvArgs a)
+     for (int t = 0; t < a.rows; ++t) {
+         const size_t at = static_cast<size_t>(t) * C + c;
+         float x = a.x_bf16 ? bf(static_cast<const uint16_t*>(a.x)[at]) : static_cast<const float*>(a.x)[at];
++        for (int r = 1; r < a.parts; ++r) x += static_cast<const float*>(a.x)[at + r * a.part_stride];
+         if (a.round_in) x = bfr(x);
+         float y;
+         if (a.dyn) {
+diff --git a/zig/src/families/inkling2/dump_main.zig b/zig/src/families/inkling2/dump_main.zig
+index b0eac2a..56fe7b6 100644
+--- a/zig/src/families/inkling2/dump_main.zig
++++ b/zig/src/families/inkling2/dump_main.zig
+@@ -5,7 +5,8 @@ const cuda = @import("cuda");
+ const ink = @import("inkling2");
+ 
+ const usage = "usage: tf-inkling2-cuda <model dir> <ids.json> <out dir> [prompt chunk rows]\n" ++
+-    "  ids.json maps text names to token ids; writes <name>.prompt.f32 and <name>.decode.f32 ([rows][real vocab])\n";
++    "  ids.json maps text names to token ids; writes <name>.prompt.f32 and <name>.decode.f32 ([rows][real vocab]);\n" ++
++    "  at two ranks set TF_INKLING2_RANK, TF_INKLING2_WORLD and NCCL_COMM_ID: each writes its vocab rows (.r<rank>.f32)\n";
+ 
+ pub fn main(init: std.process.Init) !u8 {
+     const a = init.arena.allocator();
+@@ -35,22 +36,38 @@ pub fn main(init: std.process.Init) !u8 {
+     defer stream.deinit();
+     var m = try ink.forward.Modules.load(&driver);
+     defer m.deinit();
++    const place = try ink.admit.place();
++    var lib: ?cuda.nccl.Library = null;
++    var comm: cuda.nccl.Comm = null;
++    if (place.world > 1) {
++        if (std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
++        lib = try cuda.nccl.Library.open();
++        var id: cuda.nccl.UniqueId = undefined;
++        // NCCL_COMM_ID names rank 0's bootstrap root: every rank's id is that address
++        try lib.?.check(lib.?.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
++        try lib.?.check(lib.?.api.ncclCommInitRank(&comm, @intCast(place.world), id, @intCast(place.rank)), "ncclCommInitRank");
++    }
++    defer if (lib) |*l| {
++        _ = l.api.ncclCommDestroy(comm);
++        l.close();
++    };
+     const c = try ink.config.Config.read(gpa, io, args[1]);
+     var t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-    var w = try ink.weights.load(gpa, io, &driver, &m.dense, stream, args[1], c, 0, 1);
++    var w = try ink.weights.load(gpa, io, &driver, &m.dense, stream, args[1], c, place.rank, place.world);
+     defer w.deinit();
+-    std.debug.print("loaded {d} layers, {d:.2} GiB in {d:.1} s\n", .{ c.layers, gib(w.bytes), secs(io, t0) });
++    std.debug.print("rank {d}/{d}: loaded {d} layers, {d:.2} GiB in {d:.1} s, vocab [{d}, {d})\n", .{ place.rank, place.world, c.layers, gib(w.bytes), secs(io, t0), w.share.vocab.lo, w.share.vocab.hi });
+     const shape: ink.forward.Shape = .{ .rows = @min(chunk, longest), .context = std.mem.alignForward(usize, longest + 1, 64), .heads = w.share.heads.len(), .kv = w.share.kv.len() };
+     var b = try ink.forward.Buffers.init(gpa, &driver, &w, shape);
+     defer b.deinit();
+     var st = try ink.forward.State.init(gpa, &driver, &w.config, shape);
+     defer st.deinit();
+-    const f: ink.forward.Forward = .{ .d = &driver, .m = &m, .w = &w, .b = &b, .shape = shape, .stream = stream };
++    var f: ink.forward.Forward = .{ .d = &driver, .m = &m, .w = &w, .b = &b, .shape = shape, .stream = stream };
++    if (lib) |*l| f.exchange = .{ .nccl = .{ .lib = l, .comm = comm } };
+     try std.Io.Dir.cwd().createDirPath(io, args[3]);
+     var out = try std.Io.Dir.cwd().openDir(io, args[3], .{});
+     defer out.close(io);
+     const nv = w.share.vocab.len();
+-    const real: usize = c.real_vocab;
++    const real: usize = if (place.world == 1) c.real_vocab else nv; // a rank's rows: the check joins and trims them
+     const row = try gpa.alloc(f32, shape.rows * nv);
+     defer gpa.free(row);
+     it = doc.value.object.iterator();
+@@ -74,7 +91,8 @@ pub fn main(init: std.process.Init) !u8 {
+                 for (0..n) |r| @memcpy(all[(at + r) * real ..][0..real], row[r * nv ..][0..real]);
+             }
+             var name: [96]u8 = undefined;
+-            try out.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name, "{s}.{s}.f32", .{ e.key_ptr.*, path }), .data = std.mem.sliceAsBytes(all) });
++            const file = if (place.world == 1) try std.fmt.bufPrint(&name, "{s}.{s}.f32", .{ e.key_ptr.*, path }) else try std.fmt.bufPrint(&name, "{s}.{s}.r{d}.f32", .{ e.key_ptr.*, path, place.rank });
++            try out.writeFile(io, .{ .sub_path = file, .data = std.mem.sliceAsBytes(all) });
+             const last = all[(ids.len - 1) * real ..][0..real];
+             std.debug.print("{s} {s}: {d} rows in {d:.2} s, last row argmax {d}\n", .{ e.key_ptr.*, path, ids.len, secs(io, t0), std.mem.indexOfMax(f32, last) });
+         }
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 2e6c055..e2eae65 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -136,6 +136,7 @@ pub const Buffers = struct {
+     pick: u64 = 0,
+     wts: u64 = 0,
+     moe: u64 = 0,
++    gathered: u64 = 0, // fp32 [world][rows][hidden]: every rank's partial of a site (world > 1)
+     exs: cuda.exl3_experts.Scratch = undefined,
+     logits: Buf = undefined, // fp32 [rows][padded vocab of the rank]
+ 
+@@ -178,6 +179,7 @@ pub const Buffers = struct {
+         b.pick = try A(&b, d, n * c.topk * 4);
+         b.wts = try A(&b, d, n * c.topk * 4);
+         b.moe = try A(&b, d, n * h * 4);
++        if (w.share.world > 1) b.gathered = try A(&b, d, w.share.world * n * h * 4);
+         const el = w.layers[0].experts;
+         b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try cuda.exl3_experts.scratchBytes(el, n, c.topk)), el, n, c.topk);
+         b.logits = try Buf.alloc(d, n * w.share.vocab.len() * 4);
+@@ -192,6 +194,15 @@ pub const Buffers = struct {
+     }
+ };
+ 
++/// How the ranks' partials (after o_proj and the experts) meet: one rank alone, or gathered over NCCL in rank order.
++pub const Exchange = union(enum) {
++    local,
++    nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm },
++};
++
++/// A conv input made of `parts` fp32 rank partials, `stride` elements apart.
++const Parts = struct { x: u64, parts: i32, stride: i64 };
++
+ pub const Forward = struct {
+     d: *const cuda.Driver,
+     m: *Modules,
+@@ -199,6 +210,29 @@ pub const Forward = struct {
+     b: *Buffers,
+     shape: Shape,
+     stream: cuda.Stream,
++    exchange: Exchange = .local,
++
++    /// Where a site's fp32 partial of `n` rows goes: this rank's slot of the gathered buffer, or `own` at one rank.
++    fn slot(f: Forward, own: u64, n: usize) u64 {
++        if (f.w.share.world == 1) return own;
++        return f.b.gathered + f.w.share.rank * n * f.w.config.hidden * 4;
++    }
++
++    /// Every rank's partial into every rank's gathered buffer; the conv kernels add them in rank order.
++    fn gather(f: Forward, n: usize) !Parts {
++        const h: usize = f.w.config.hidden;
++        switch (f.exchange) {
++            .local => return error.Inkling2NoExchange,
++            .nccl => |x| try x.lib.check(x.lib.api.ncclAllGather(f.slot(0, n), f.b.gathered, n * h, .f32, x.comm, f.stream.handle), "ncclAllGather"),
++        }
++        return .{ .x = f.b.gathered, .parts = @intCast(f.w.share.world), .stride = @intCast(n * h) };
++    }
++
++    /// The conv input of a partial site: the local buffer at one rank, else the gathered parts.
++    fn summed(f: Forward, own: u64, n: usize) !Parts {
++        if (f.w.share.world == 1) return .{ .x = own, .parts = 1, .stride = 0 };
++        return f.gather(n);
++    }
+ 
+     fn dense(f: Forward, wt: cuda.exl3.Weight, x: u64, rows: usize, y: u64, dt: cuda.exl3.DType) !void {
+         try f.m.dense.decode(f.stream, wt, x, .bf16, rows, y, dt);
+@@ -266,22 +300,24 @@ pub const Forward = struct {
+             try kernels.prep(&f.m.attn, s, rows, lay, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.kc[i], st.vc[i]);
+             try kernels.relTable(&f.m.attn, s, rows, b.relo, a.rel_proj, b.tab);
+             try kernels.attend(&f.m.attn, s, rows, lay, b.qo, st.kc[i], st.vc[i], b.tab, b.part_o, b.part_ml, b.sink, b.gate, b.att);
+-            try f.dense(a.o, b.att, n, b.ao, .f32);
++            try f.dense(a.o, b.att, n, f.slot(b.ao, n), .f32);
++            const ao = try f.summed(b.ao, n);
+             const boundary = i % c.block_layers == 0;
+             if (boundary) {
+                 if (nb == ops.max_blocks) return error.Inkling2Blocks;
+                 try copy(f.d, b.blocks + nb * n * h * 2, b.x, n * h * 2, s);
+                 nb += 1;
+             }
+-            try ops.conv(k, s, .{ .x = b.ao, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1 });
++            try ops.conv(k, s, .{ .x = ao.x, .parts = ao.parts, .part_stride = ao.stride, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1 });
+             var mm: ops.MixArgs = .{ .partial = b.resid, .query = l.mlp_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 0, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+             for (0..nb) |j| mm.blocks[j] = b.blocks + j * n * h * 2;
+             mm.norm[0] = l.mlp_norm;
+             try ops.mix(k, s, mm);
+             try ops.rowdot(k, s, b.normed, l.router, b.scores, n, c.experts, h, false, true);
+             try ops.topk(k, s, b.scores, l.bias, b.pick, b.wts, n, c.experts, c.topk, c.route_scale);
+-            try experts.run(&f.m.experts, k, s, l.experts, .{ .gate = c.gate_softcap, .up = c.up_softcap }, b.normed, h, .bf16, b.pick, b.wts, n, b.moe, b.exs);
+-            try ops.conv(k, s, .{ .x = b.moe, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2 });
++            try experts.run(&f.m.experts, k, s, l.experts, .{ .gate = c.gate_softcap, .up = c.up_softcap }, b.normed, h, .bf16, b.pick, b.wts, n, f.slot(b.moe, n), b.exs);
++            const mo = try f.summed(b.moe, n);
++            try ops.conv(k, s, .{ .x = mo.x, .parts = mo.parts, .part_stride = mo.stride, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2 });
+         }
+         var fm: ops.MixArgs = .{ .partial = b.x, .query = f.w.out_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+         for (0..nb) |j| fm.blocks[j] = b.blocks + j * n * h * 2;
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index bddab85..ae51efd 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -29,6 +29,8 @@ pub const ConvArgs = extern struct {
+     base: u64 = 0,
+     resid: u64 = 0,
+     out: u64 = 0,
++    part_stride: i64 = 0, // elements between the ranks' partials of x (parts > 1)
++    parts: i32 = 1,
+     x_bf16: i32 = 0,
+     round_in: i32 = 0,
+     heads: i32 = 1,
+@@ -153,6 +155,6 @@ pub fn softcap(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, cap: f32) !v
+ 
+ test "ops: the argument structs keep ops.cu's layouts" {
+     try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
+-    try std.testing.expectEqual(@as(usize, 7 * 8 + 6 * 4), @sizeOf(ConvArgs));
++    try std.testing.expectEqual(@as(usize, 8 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
+     try std.testing.expectEqual(@as(usize, 6 * 8 + 6 * 4), @sizeOf(GateUpArgs));
+ }

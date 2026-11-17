@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:06:55 +1100
+Subject: [PATCH 06/45] inkling2: attention partials start at the call's first
+ chunk
+
+Partials were indexed by absolute chunk, so a sliding layer at depth sized
+them for every chunk up to the position: 4,096 at 1M, about 100 MB a prompt
+row. Each call now passes its earliest row's first chunk and launches only
+the chunks its rows read (at most 4-5 for a decode row on a sliding layer).
+Chunk boundaries stay absolute, so the bits do not change: the 2-layer pack's
+logits are byte-identical before and after on every text and path.
+---
+ zig/kernels/cuda/inkling2/attention.cu     | 10 +++++-----
+ zig/src/families/inkling2/forward.zig      |  8 ++++----
+ zig/src/families/inkling2/kernels.zig      | 21 ++++++++++++++++++---
+ zig/src/families/inkling2/kernels_test.zig | 13 ++++++++++++-
+ 4 files changed, 39 insertions(+), 13 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index 59fa313..f6fbe7a 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -116,13 +116,13 @@ extern "C" __global__ void __launch_bounds__(128)
+     tf_ink2_attn(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
+                  const uint16_t* __restrict__ tab, const Seg* __restrict__ segs, const int2* __restrict__ tiles,
+                  float* __restrict__ part_o, float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
+-                 int window, int chunk, int chunks, float scale) {
++                 int window, int chunk, int c0, int chunks, float scale) {
+     using namespace ink2;
+     __shared__ __align__(16) uint16_t ks[kKeys * kPad];
+     __shared__ __align__(16) uint16_t vs[kKeys * kPad];
+     const int2 tile = tiles[blockIdx.x];
+     const Seg s = segs[tile.x];
+-    const int kvh = blockIdx.y, c = blockIdx.z;
++    const int kvh = blockIdx.y, c = c0 + static_cast<int>(blockIdx.z);
+     const int group = heads / kv_heads;
+     const int total = s.n * group;
+     const int m0 = tile.y;
+@@ -234,7 +234,7 @@ extern "C" __global__ void __launch_bounds__(128)
+         l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+         l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+         if (!ok[i]) continue;
+-        const size_t at = prow[i] * chunks + c;
++        const size_t at = prow[i] * chunks + (c - c0);
+         if (t == 0) part_ml[at] = make_float2(m[i], l[i]);
+         float* o = part_o + at * kDim + 2 * t;
+         for (int n = 0; n < 16; ++n) *reinterpret_cast<float2*>(o + 8 * n) = make_float2(acc[n][2 * i], acc[n][2 * i + 1]);
+@@ -245,7 +245,7 @@ extern "C" __global__ void __launch_bounds__(128)
+ extern "C" __global__ void tf_ink2_merge(const float* __restrict__ part_o, const float2* __restrict__ part_ml,
+                                          const uint16_t* __restrict__ sink, const uint16_t* __restrict__ gate,
+                                          const int* __restrict__ rpos, uint16_t* __restrict__ out, int heads,
+-                                         int window, int chunk, int chunks) {
++                                         int window, int chunk, int c0, int chunks) {
+     using namespace ink2;
+     const size_t rh = blockIdx.x;
+     const int row = static_cast<int>(rh / heads), d = threadIdx.x;
+@@ -253,7 +253,7 @@ extern "C" __global__ void tf_ink2_merge(const float* __restrict__ part_o, const
+     const int lo = window > 0 ? max(0, pos - window + 1) : 0;
+     float mm = -INFINITY, ll = 0.0f, o = 0.0f;
+     for (int c = lo / chunk; c <= pos / chunk; ++c) {
+-        const size_t at = rh * chunks + c;
++        const size_t at = rh * chunks + (c - c0);
+         const float2 ml = part_ml[at];
+         const float mn = fmaxf(mm, ml.x);
+         const float a = exp2f(mm - mn), b = exp2f(ml.x - mn);
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 5d7bd14..2e6c055 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -53,8 +53,8 @@ pub const Shape = struct {
+         return if (c.layer[i] == .sliding) s.sliding(c) else s.global();
+     }
+ 
+-    fn chunks(s: Shape) u32 {
+-        return @max(kernels.chunks(s.context - 1, kernels.sliding_chunk), kernels.chunks(s.context - 1, kernels.global_chunk));
++    fn chunks(s: Shape, c: *const cfg.Config) u32 {
++        return @max(kernels.spanMax(s.rows, s.context, s.sliding(c)), kernels.spanMax(s.rows, s.context, s.global()));
+     }
+ };
+ 
+@@ -169,7 +169,7 @@ pub const Buffers = struct {
+         b.qo = try A(&b, d, n * s.heads * hd * 2);
+         b.relo = try A(&b, d, n * s.heads * c.d_rel * 2);
+         b.tab = try A(&b, d, kernels.tableBytes(n, @intCast(s.heads)));
+-        const nc = s.chunks();
++        const nc = s.chunks(c);
+         b.part_o = try A(&b, d, n * s.heads * nc * hd * 4);
+         b.part_ml = try A(&b, d, n * s.heads * nc * 8);
+         b.att = try A(&b, d, n * s.heads * hd * 2);
+@@ -232,7 +232,7 @@ pub const Forward = struct {
+         try s.synchronize(); // the previous call's kernels may still read the staged rows
+         try b.ids.upload(0, host.items);
+         const base = b.ids.ptr;
+-        const rows: kernels.Rows = .{ .rows = @intCast(n), .heads = @intCast(f.shape.heads), .kv_heads = @intCast(f.shape.kv), .pos = base + n * 4, .seg_of = base + n * 8, .segs = base + seg_at, .tiles = base + tiles_at, .n_tiles = @intCast(nt), .last_pos = @intCast(p0 + n - 1) };
++        const rows: kernels.Rows = .{ .rows = @intCast(n), .heads = @intCast(f.shape.heads), .kv_heads = @intCast(f.shape.kv), .pos = base + n * 4, .seg_of = base + n * 8, .segs = base + seg_at, .tiles = base + tiles_at, .n_tiles = @intCast(nt), .last_pos = @intCast(p0 + n - 1), .first_pos = @intCast(p0) };
+ 
+         try ops.embed(k, s, base, n, f.w.embed, f.w.embed_norm, b.x, h, c.eps);
+         var nb: usize = 0;
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 20bd242..6ad2420 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -61,6 +61,19 @@ pub fn chunks(last_pos: usize, chunk: u32) u32 {
+     return @intCast(last_pos / chunk + 1);
+ }
+ 
++/// The chunks a call's rows at first..last read: from the earliest row's first key (window-relative partials).
++pub fn span(first_pos: usize, last_pos: usize, l: Layer) struct { c0: u32, n: u32 } {
++    const lo = if (l.window > 0) (first_pos + 1) -| l.window else 0;
++    const c0: u32 = @intCast(lo / l.chunk);
++    return .{ .c0 = c0, .n = chunks(last_pos, l.chunk) - c0 };
++}
++
++/// Most chunks one call of up to `rows` rows reads on a layer whose positions stay below `context`.
++pub fn spanMax(rows: usize, context: usize, l: Layer) u32 {
++    if (l.window == 0) return chunks(context - 1, l.chunk);
++    return @intCast(@min(chunks(context - 1, l.chunk), (rows + l.window - 2) / l.chunk + 2));
++}
++
+ /// Scratch bytes of a call: the bias table (bf16) and the partials (fp32 sums plus each chunk's max and total).
+ pub fn tableBytes(rows: usize, heads: u32) usize {
+     return rows * heads * extent * 2;
+@@ -110,6 +123,7 @@ pub const Rows = struct {
+     tiles: u64,
+     n_tiles: u32,
+     last_pos: u32,
++    first_pos: u32, // the call's earliest row position (its chunk base)
+ };
+ 
+ fn int(x: anytype) c_int {
+@@ -143,15 +157,16 @@ pub fn relTable(k: *const Kernels, s: cuda.Stream, r: Rows, rel: u64, proj: u64,
+ 
+ /// Attention over the layer's cache into chunk partials, then the ordered merge with the sink and the gate.
+ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, q: u64, kc: u64, vc: u64, tab: u64, part_o: u64, part_ml: u64, sink: u64, gate: u64, out: u64) !void {
+-    const n = chunks(r.last_pos, l.chunk);
++    const sp = span(r.first_pos, r.last_pos, l);
++    const n = sp.n;
+     var a: cuda.Args = .{};
+     for ([_]u64{ q, kc, vc, tab, r.segs, r.tiles, part_o, part_ml }) |v| a.add(v);
+-    for ([_]u32{ r.heads, r.kv_heads, l.ring, l.window, l.chunk, n }) |v| a.add(int(v));
++    for ([_]u32{ r.heads, r.kv_heads, l.ring, l.window, l.chunk, sp.c0, n }) |v| a.add(int(v));
+     a.add(@as(f32, 1.0 / @sqrt(@as(f32, head_dim))));
+     try go(k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = n }, 128, &a);
+     var b: cuda.Args = .{};
+     for ([_]u64{ part_o, part_ml, sink, gate, r.pos, out }) |v| b.add(v);
+-    for ([_]u32{ r.heads, l.window, l.chunk, n }) |v| b.add(int(v));
++    for ([_]u32{ r.heads, l.window, l.chunk, sp.c0, n }) |v| b.add(int(v));
+     try go(k.merge, s, .{ .x = r.rows * r.heads }, head_dim, &b);
+ }
+ 
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index b609b5e..e91f5c8 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -62,7 +62,7 @@ test "inkling2 kernels: one decode row at 1M launches 64 chunks for each of a ra
+     };
+     const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4) };
+     const s: cuda.Stream = .{ .d = &d, .handle = null };
+-    const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
++    const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575, .first_pos = 1048575 };
+     const l = k.Layer.global(1048576);
+     try k.prep(&kern, s, r, l, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, 0, 0);
+     try k.relTable(&kern, s, r, 0, 0, 0);
+@@ -75,3 +75,14 @@ test "inkling2 kernels: one decode row at 1M launches 64 chunks for each of a ra
+     try t.expectEqual([4]u32{ 32, 256, 128, 128 }, Fake.blocks);
+     try t.expectEqual([4]u32{ 0, 0, 0, 0 }, Fake.shared);
+ }
++
++test "inkling2 kernels: a call's partials start at its earliest row's first chunk (sliding at depth: 4 not 4096)" {
++    const sl = k.Layer.sliding(1024, 1);
++    try t.expectEqual(@as(u32, 4092), k.span(1048575, 1048575, sl).c0);
++    try t.expectEqual(@as(u32, 4), k.span(1048575, 1048575, sl).n);
++    try t.expectEqual(@as(u32, 5), k.span(1048500, 1048500, sl).n);
++    try t.expectEqual(@as(u32, 0), k.span(1023, 1023, sl).c0); // keys 0..1023
++    try t.expectEqual(@as(u32, 1), k.span(1279, 1279, sl).c0); // keys 256..1279
++    try t.expectEqual(@as(u32, 64), k.span(1048575, 1048575, k.Layer.global(1048576)).n);
++    try t.expect(k.spanMax(2048, 1048576, k.Layer.sliding(1024, 2048)) >= k.span(900000, 902047, k.Layer.sliding(1024, 2048)).n);
++}

@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:40:54 +1100
+Subject: [PATCH 23/45] inkling2: keep sliding partials out of a neighbour's
+ slots
+
+A sliding tile runs a fixed set of key chunks from its first row's
+first key. When a window's rows straddle a 256-key chunk edge, a row
+also stored its empty partial for chunks outside its own keys, and
+that slot belonged to the next or previous (row, head). The stray
+store races the real one and can drop keys or turn the merge into NaN.
+
+Below 81,920 positions this hits 8-row windows starting at 248..254
+past a chunk edge, such as 2,300 in the drafted check's long text.
+Rows now store only the chunks the merge reads.
+---
+ zig/kernels/cuda/inkling2/attention.cu     |  3 +-
+ zig/src/families/inkling2/kernels.zig      | 12 ++++++
+ zig/src/families/inkling2/kernels_test.zig | 50 ++++++++++++++++++++++
+ 3 files changed, 64 insertions(+), 1 deletion(-)
+
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index c5f1c18..b94228a 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -234,7 +234,8 @@ extern "C" __global__ void __launch_bounds__(128)
+     for (int i = 0; i < 2; ++i) {
+         l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+         l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+-        if (!ok[i]) continue;
++        // a chunk outside the row's keys stores nothing: its slot is a neighbour (row, head)'s (kernels.partialSlot)
++        if (!ok[i] || c < lo[i] / chunk || c > pos[i] / chunk) continue;
+         const size_t at = prow[i] * chunks + (c - (window > 0 ? lo[i] / chunk : c0));
+         if (t == 0) part_ml[at] = make_float2(m[i], l[i]);
+         float* o = part_o + at * kDim + 2 * t;
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 7e6dc69..060b57f 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -168,6 +168,18 @@ pub fn slotsFor(l: Layer, context: usize) u32 {
+     return chunks(context - 1, l.chunk);
+ }
+ 
++/// The key chunk block `z` of a tile reads (attention.cu): a sliding tile counts from its first row's first key.
++pub fn tileChunk(l: Layer, first_pos: usize, z: usize) usize {
++    return if (l.window > 0) ((first_pos + 1) -| l.window) / l.chunk + z else z;
++}
++
++/// The partial slot tf_ink2_attn stores chunk `c` of a row at `pos` in; null outside the row's keys (stores nothing).
++pub fn partialSlot(l: Layer, c: usize, pos: usize) ?usize {
++    const lo = if (l.window > 0) (pos + 1) -| l.window else 0;
++    if (c < lo / l.chunk or c > pos / l.chunk) return null;
++    return c - lo / l.chunk;
++}
++
+ test {
+     _ = @import("kernels_test.zig");
+ }
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index a51ba25..eaeae8c 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -84,3 +84,53 @@ test "inkling2 kernels: sliding partials are a row's window at any depth, a tile
+     try t.expectEqual(@as(u32, 64), k.slotsFor(k.Layer.global(1048576), 1048576));
+     try t.expectEqual(@as(u32, 8), k.slotsFor(k.Layer.global(131072), 131072));
+ }
++
++/// A call's sliding stores as tf_ink2_attn makes them: each slot the merge reads once; returns the old strays.
++fn slidingStores(a: std.mem.Allocator, p0: usize, n: usize) !usize {
++    const group = 6;
++    const l = k.Layer.sliding(1024, 2048);
++    const stride: usize = k.slotsFor(l, 1); // 5 below 81,920: a stray store lands on a neighbour (row, head)'s slots
++    const count = try a.alloc(u8, n * group * stride);
++    defer a.free(count);
++    @memset(count, 0);
++    var tl: [256]k.Tile = undefined;
++    const segs = [_]k.Seg{.{ .row0 = 0, .n = @intCast(n), .p0 = @intCast(p0), .off = 0 }};
++    var stray: usize = 0;
++    for (tl[0..try k.tiles(&segs, group, &tl)]) |tile| {
++        const m0: usize = @intCast(tile.m0);
++        const m_last = @min(m0 + 63, n * group - 1);
++        const first = p0 + m0 / group;
++        const hi = p0 + m_last / group;
++        for (0..k.tileChunks(group, l)) |z| {
++            const c = k.tileChunk(l, first, z);
++            if (c * l.chunk > hi or c * l.chunk + l.chunk - 1 < (first + 1) -| l.window) continue;
++            for (m0..m_last + 1) |mr| {
++                const pos = p0 + mr / group;
++                const raw = @as(isize, @intCast(c)) - @as(isize, @intCast(((pos + 1) -| l.window) / l.chunk));
++                if (raw < 0 or raw >= stride) stray += 1;
++                const s = k.partialSlot(l, c, pos) orelse continue;
++                try t.expect(s < stride);
++                count[mr * stride + s] += 1;
++            }
++        }
++    }
++    for (0..n * group) |mr| {
++        const pos = p0 + mr / group;
++        const read = pos / l.chunk - ((pos + 1) -| l.window) / l.chunk + 1; // the merge folds slots 0..read-1
++        for (0..stride) |s| try t.expectEqual(@as(u8, @intFromBool(s < read)), count[mr * stride + s]);
++    }
++    return stray;
++}
++
++test "inkling2 kernels: sliding stores stay in their own slots for windows that straddle a chunk edge" {
++    const a = t.allocator;
++    // the drafted check's long text: 8-row windows at 2,296..2,302 (a window's first keys cross chunk 5's edge)
++    try t.expectEqual(@as(usize, 0), try slidingStores(a, 2295, 8));
++    try t.expect(try slidingStores(a, 2300, 8) > 0);
++    try t.expect(try slidingStores(a, 2296, 8) > 0);
++    var p0: usize = 0;
++    while (p0 < 4400) : (p0 += 1) for (1..9) |n| {
++        _ = try slidingStores(a, p0, n);
++    };
++    for ([_]usize{ 0, 2048, 4096 }) |at| _ = try slidingStores(a, at, 2048);
++}

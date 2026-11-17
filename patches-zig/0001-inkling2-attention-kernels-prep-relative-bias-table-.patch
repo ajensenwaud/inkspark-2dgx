@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:49:19 +1100
+Subject: [PATCH 01/45] inkling2: attention kernels (prep, relative-bias table,
+ chunked attention, merge)
+
+Inkling 2's attention on CUDA: q/k L2 clips with the per-head q scale, the
+value norm without gamma, the rel vector's clip, tau on global layers, the
+bf16 relative-bias table, a tensor-core attention over fixed key chunks and a
+merge that folds the chunks in order, adds the sink and applies the gate.
+One kernel serves prompt chunks and decode rows, sliding and global layers.
+---
+ zig/kernels/cuda/inkling2/attention.cu | 270 +++++++++++++++++++++++++
+ 1 file changed, 270 insertions(+)
+ create mode 100644 zig/kernels/cuda/inkling2/attention.cu
+
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+new file mode 100644
+index 0000000..c2c8fe8
+--- /dev/null
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -0,0 +1,270 @@
++// Inkling 2 attention: q/k/v/rel preparation, the relative-bias table, chunked tensor-core attention and the merge.
++#include <cstdint>
++#include <cuda_bf16.h>
++
++namespace ink2 {
++
++constexpr int kDim = 128;
++constexpr int kRel = 16;
++constexpr int kExtent = 1024;
++constexpr int kKeys = 64;
++constexpr int kPad = kDim + 8;
++constexpr float kLog2e = 1.4426950408889634f;
++
++// One stream's rows in a call: rows row0..row0+n-1 sit at positions p0..p0+n-1; `off` is its cache's element offset.
++struct Seg {
++    int row0;
++    int n;
++    int p0;
++    int pad;
++    long long off;
++};
++
++__device__ __forceinline__ float bf(uint16_t u) { return __uint_as_float(static_cast<uint32_t>(u) << 16); }
++
++__device__ __forceinline__ uint16_t tobf(float f) { return __bfloat16_as_ushort(__float2bfloat16_rn(f)); }
++
++__device__ __forceinline__ uint32_t pack(uint16_t lo, uint16_t hi) {
++    return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
++}
++
++__device__ __forceinline__ float warpSum(float v) {
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++    return v;
++}
++
++__device__ __forceinline__ void mma(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++
++// L2 clip of one head vector held 4 values a lane: scale down to `thr` when longer, as Inkling2L2Clip.
++__device__ __forceinline__ void clip(float* x, float thr) {
++    const float norm = sqrtf(warpSum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]));
++    const float f = fminf(thr / (norm + 1e-6f), 1.0f);
++    for (int i = 0; i < 4; ++i) x[i] *= f;
++}
++
++}  // namespace ink2
++
++using ink2::Seg;
++
++// Per row and head: q = clip(q * q_scale) (* tau, global), rel = clip(rel * rel_scale) (* tau), k = clip(k), v = rms(v).
++extern "C" __global__ void tf_ink2_prep(const uint16_t* __restrict__ q_raw, const uint16_t* __restrict__ k_raw,
++                                        const uint16_t* __restrict__ v_raw, const uint16_t* __restrict__ rel_raw,
++                                        const uint16_t* __restrict__ q_scale, const uint16_t* __restrict__ rel_scale,
++                                        const int* __restrict__ rpos, const int* __restrict__ rseg,
++                                        const Seg* __restrict__ segs, uint16_t* __restrict__ q_out,
++                                        uint16_t* __restrict__ rel_out, uint16_t* __restrict__ kc,
++                                        uint16_t* __restrict__ vc, int heads, int kv_heads, int ring, int global,
++                                        float qk_clip, float rel_clip, float floor_pos, float alpha, float eps) {
++    using namespace ink2;
++    const int row = blockIdx.x, y = blockIdx.y, lane = threadIdx.x;
++    const int pos = rpos[row];
++    const float tau = global ? 1.0f + alpha * logf(fmaxf(static_cast<float>(pos + 1) / floor_pos, 1.0f)) : 1.0f;
++    float x[4];
++    if (y < heads) {
++        const uint16_t* src = q_raw + (static_cast<size_t>(row) * heads + y) * kDim;
++        for (int i = 0; i < 4; ++i) x[i] = bf(src[lane * 4 + i]) * bf(q_scale[y * kDim + lane * 4 + i]);
++        clip(x, qk_clip);
++        uint16_t* dst = q_out + (static_cast<size_t>(row) * heads + y) * kDim;
++        for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = global ? tobf(bf(tobf(x[i])) * tau) : tobf(x[i]);
++        float r = lane < kRel ? bf(rel_raw[(static_cast<size_t>(row) * heads + y) * kRel + lane]) *
++                                    bf(rel_scale[y * kRel + lane])
++                              : 0.0f;
++        const float norm = sqrtf(warpSum(r * r));
++        r *= fminf(rel_clip / (norm + 1e-6f), 1.0f);
++        if (lane < kRel) {
++            const uint16_t v = global ? tobf(bf(tobf(r)) * tau) : tobf(r);
++            rel_out[(static_cast<size_t>(row) * heads + y) * kRel + lane] = v;
++        }
++        return;
++    }
++    const bool key = y < heads + kv_heads;
++    const int h = key ? y - heads : y - heads - kv_heads;
++    const uint16_t* src = (key ? k_raw : v_raw) + (static_cast<size_t>(row) * kv_heads + h) * kDim;
++    for (int i = 0; i < 4; ++i) x[i] = bf(src[lane * 4 + i]);
++    if (key) {
++        clip(x, qk_clip);
++    } else {
++        const float r = rsqrtf(warpSum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]) / kDim + eps);
++        for (int i = 0; i < 4; ++i) x[i] *= r;
++    }
++    const Seg s = segs[rseg[row]];
++    uint16_t* dst = (key ? kc : vc) + s.off + (static_cast<size_t>(h) * ring + pos % ring) * kDim;
++    for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = tobf(x[i]);
++}
++
++// tab[row, head, d] = bf16(rel[row, head, :] . proj[:, d]) for d < 1024, fp32 sums in tap order (rel_logits_proj).
++extern "C" __global__ void tf_ink2_rel_table(const uint16_t* __restrict__ rel, const uint16_t* __restrict__ proj,
++                                             uint16_t* __restrict__ tab) {
++    using namespace ink2;
++    const size_t rh = blockIdx.x;
++    float r[kRel];
++    for (int j = 0; j < kRel; ++j) r[j] = bf(rel[rh * kRel + j]);
++    for (int d = threadIdx.x; d < kExtent; d += blockDim.x) {
++        float acc = 0.0f;
++        for (int j = 0; j < kRel; ++j) acc += r[j] * bf(proj[j * kExtent + d]);
++        tab[rh * kExtent + d] = tobf(acc);
++    }
++}
++
++// One tile of 64 (row, head) pairs of a key head over one key chunk: fp32 scores plus the table's bias, bf16 P.V.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_attn(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
++                 const uint16_t* __restrict__ tab, const Seg* __restrict__ segs, const int2* __restrict__ tiles,
++                 float* __restrict__ part_o, float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
++                 int window, int chunk, int chunks, float scale) {
++    using namespace ink2;
++    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
++    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
++    const int2 tile = tiles[blockIdx.x];
++    const Seg s = segs[tile.x];
++    const int kvh = blockIdx.y, c = blockIdx.z;
++    const int group = heads / kv_heads;
++    const int total = s.n * group;
++    const int m0 = tile.y;
++    const int m_last = min(m0 + 63, total - 1);
++    const int tile_hi = s.p0 + m_last / group;
++    const int tile_lo = window > 0 ? max(0, s.p0 + m0 / group - window + 1) : 0;
++    const int c_lo = c * chunk, c_hi = c_lo + chunk - 1;
++    if (c_lo > tile_hi || c_hi < tile_lo) return;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
++    int mr[2], pos[2], lo[2];
++    bool ok[2];
++    size_t prow[2];
++    uint32_t qa[8][4];
++    for (int i = 0; i < 2; ++i) {
++        mr[i] = m0 + warp * 16 + g + i * 8;
++        ok[i] = mr[i] < total;
++        const int lr = ok[i] ? mr[i] / group : 0;
++        pos[i] = ok[i] ? s.p0 + lr : -1;
++        lo[i] = window > 0 ? max(0, pos[i] - window + 1) : 0;
++        prow[i] = static_cast<size_t>(s.row0 + lr) * heads + kvh * group + (ok[i] ? mr[i] % group : 0);
++    }
++    for (int k = 0; k < 8; ++k) {
++        for (int i = 0; i < 2; ++i) {
++            const uint32_t* src = reinterpret_cast<const uint32_t*>(q + prow[i] * kDim + 16 * k + 2 * t);
++            qa[k][i] = ok[i] ? src[0] : 0u;
++            qa[k][i + 2] = ok[i] ? src[4] : 0u;
++        }
++    }
++    float acc[16][4];
++    for (int n = 0; n < 16; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
++    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
++    const int k_lo = max(c_lo, tile_lo), k_hi = min(c_hi, tile_hi);
++    const size_t head_base = s.off + static_cast<size_t>(kvh) * ring * kDim;
++    for (int kt = k_lo & ~(kKeys - 1); kt <= k_hi; kt += kKeys) {
++        __syncthreads();
++        const size_t slot0 = static_cast<size_t>(kt % ring);
++        for (int e = threadIdx.x; e < kKeys * (kDim / 8); e += 128) {
++            const int key = e >> 4, col = (e & 15) * 8;
++            const int kp = kt + key;
++            uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
++            if (kp >= k_lo && kp <= k_hi) {
++                const size_t at = head_base + (slot0 + key) * kDim + col;
++                kv = *reinterpret_cast<const uint4*>(kc + at);
++                vv = *reinterpret_cast<const uint4*>(vc + at);
++            }
++            *reinterpret_cast<uint4*>(ks + key * kPad + col) = kv;
++            *reinterpret_cast<uint4*>(vs + key * kPad + col) = vv;
++        }
++        __syncthreads();
++        float sc[8][4];
++        for (int j = 0; j < 8; ++j) {
++            sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.0f;
++            const uint16_t* krow = ks + (8 * j + g) * kPad + 2 * t;
++            for (int k = 0; k < 8; ++k) {
++                const uint32_t b0 = *reinterpret_cast<const uint32_t*>(krow + 16 * k);
++                const uint32_t b1 = *reinterpret_cast<const uint32_t*>(krow + 16 * k + 8);
++                mma(sc[j], qa[k][0], qa[k][1], qa[k][2], qa[k][3], b0, b1);
++            }
++        }
++        float mx[2] = {-INFINITY, -INFINITY};
++        for (int j = 0; j < 8; ++j) {
++            for (int e = 0; e < 4; ++e) {
++                const int i = e >> 1;
++                const int kp = kt + 8 * j + 2 * t + (e & 1);
++                const bool live = ok[i] && kp >= lo[i] && kp <= pos[i] && kp >= c_lo && kp <= c_hi;
++                const int d = pos[i] - kp;
++                const float bias = live && d < kExtent ? bf(tab[prow[i] * kExtent + d]) : 0.0f;
++                sc[j][e] = live ? (sc[j][e] * scale + bias) * kLog2e : -INFINITY;
++                mx[i] = fmaxf(mx[i], sc[j][e]);
++            }
++        }
++        float alpha[2], mu[2];
++        for (int i = 0; i < 2; ++i) {
++            mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 1));
++            mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 2));
++            const float mn = fmaxf(m[i], mx[i]);
++            mu[i] = mn == -INFINITY ? 0.0f : mn;
++            alpha[i] = exp2f(m[i] - mu[i]);
++            m[i] = mn;
++            l[i] *= alpha[i];
++        }
++        uint16_t p[8][4];
++        for (int j = 0; j < 8; ++j) {
++            for (int e = 0; e < 4; ++e) {
++                const int i = e >> 1;
++                p[j][e] = tobf(exp2f(sc[j][e] - mu[i]));
++                l[i] += bf(p[j][e]);
++            }
++        }
++        for (int n = 0; n < 16; ++n) {
++            acc[n][0] *= alpha[0];
++            acc[n][1] *= alpha[0];
++            acc[n][2] *= alpha[1];
++            acc[n][3] *= alpha[1];
++        }
++        for (int u = 0; u < 4; ++u) {
++            const uint32_t a0 = pack(p[2 * u][0], p[2 * u][1]), a1 = pack(p[2 * u][2], p[2 * u][3]);
++            const uint32_t a2 = pack(p[2 * u + 1][0], p[2 * u + 1][1]), a3 = pack(p[2 * u + 1][2], p[2 * u + 1][3]);
++            const uint16_t* v0 = vs + (16 * u + 2 * t) * kPad + g;
++            for (int n = 0; n < 16; ++n) {
++                const uint16_t* vp = v0 + 8 * n;
++                const uint32_t b0 = pack(vp[0], vp[kPad]);
++                const uint32_t b1 = pack(vp[8 * kPad], vp[9 * kPad]);
++                mma(acc[n], a0, a1, a2, a3, b0, b1);
++            }
++        }
++    }
++    for (int i = 0; i < 2; ++i) {
++        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
++        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
++        if (!ok[i]) continue;
++        const size_t at = prow[i] * chunks + c;
++        if (t == 0) part_ml[at] = make_float2(m[i], l[i]);
++        float* o = part_o + at * kDim + 2 * t;
++        for (int n = 0; n < 16; ++n) *reinterpret_cast<float2*>(o + 8 * n) = make_float2(acc[n][2 * i], acc[n][2 * i + 1]);
++    }
++}
++
++// Per (row, head): the row's chunks folded in order, the sink as one more logit with a zero value, then the gate.
++extern "C" __global__ void tf_ink2_merge(const float* __restrict__ part_o, const float2* __restrict__ part_ml,
++                                         const uint16_t* __restrict__ sink, const uint16_t* __restrict__ gate,
++                                         const int* __restrict__ rpos, uint16_t* __restrict__ out, int heads,
++                                         int window, int chunk, int chunks) {
++    using namespace ink2;
++    const size_t rh = blockIdx.x;
++    const int row = static_cast<int>(rh / heads), d = threadIdx.x;
++    const int pos = rpos[row];
++    const int lo = window > 0 ? max(0, pos - window + 1) : 0;
++    float mm = -INFINITY, ll = 0.0f, o = 0.0f;
++    for (int c = lo / chunk; c <= pos / chunk; ++c) {
++        const size_t at = rh * chunks + c;
++        const float2 ml = part_ml[at];
++        const float mn = fmaxf(mm, ml.x);
++        const float a = exp2f(mm - mn), b = exp2f(ml.x - mn);
++        ll = ll * a + ml.y * b;
++        o = o * a + part_o[at * kDim + d] * b;
++        mm = mn;
++    }
++    const float sk = bf(sink[rh]) * kLog2e;
++    const float mf = fmaxf(mm, sk);
++    const float a = exp2f(mm - mf);
++    const float y = o * a / (ll * a + exp2f(sk - mf));
++    const float gv = bf(gate[rh * kDim + d]);
++    out[rh * kDim + d] = tobf(y * (1.0f / (1.0f + expf(-gv))));
++}

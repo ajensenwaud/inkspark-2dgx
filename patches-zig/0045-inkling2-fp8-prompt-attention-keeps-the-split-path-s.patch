@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 18:23:11 +1100
+Subject: [PATCH 45/45] inkling2: fp8 prompt attention keeps the split path's
+ bits
+
+With fp8 caches the global prompt kernel copies the raw codes and scales
+in two async stages and dequantises each tile to bf16 before its barrier.
+The tile values equal tf_ink2_attn8's, so the partials stay bit-identical.
+---
+ zig/kernels/cuda/inkling2/prompt_attention.cu | 139 +++++++++++++++---
+ zig/src/families/inkling2/kernels.zig         |  12 +-
+ zig/src/families/inkling2/kernels_test.zig    |  15 +-
+ 3 files changed, 138 insertions(+), 28 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/prompt_attention.cu b/zig/kernels/cuda/inkling2/prompt_attention.cu
+index db932e6..6b72822 100644
+--- a/zig/kernels/cuda/inkling2/prompt_attention.cu
++++ b/zig/kernels/cuda/inkling2/prompt_attention.cu
+@@ -87,18 +87,68 @@ __device__ __forceinline__ void loadTile(uint16_t* ks, uint16_t* vs, const uint1
+     asm volatile("cp.async.commit_group;\n" ::);
+ }
+ 
+-}  // namespace ink2p
++// An f16 (low half of h) as fp32, exact.
++__device__ __forceinline__ float h2f(uint32_t h) {
++    float f;
++    asm("cvt.f32.f16 %0, %1;\n" : "=f"(f) : "h"(static_cast<unsigned short>(h)));
++    return f;
++}
+ 
+-// One stream's prompt rows on a global layer: block (tile of kPairs pairs, key head, chunk), partials per chunk.
+-extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1)
+-    tf_ink2_attn_prompt(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
+-                        const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab,
+-                        const ink2p::Seg* __restrict__ segs, float* __restrict__ part_o,
+-                        float2* __restrict__ part_ml, int heads, int kv_heads, int ring, int chunk, int c0,
+-                        int chunks, float scale) {
+-    using namespace ink2p;
+-    extern __shared__ __align__(16) uint16_t smem[];
+-    const ink2p::Seg s = segs[0];
++// Four codes times the row's scale, rounded once to bf16: tile8's values for every finite code (exact f16 unpack).
++__device__ __forceinline__ uint2 deq4(uint32_t w, float s) {
++    uint32_t p, q;
++    asm("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(p) : "h"(static_cast<unsigned short>(w & 0xFFFFu)));
++    asm("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(q) : "h"(static_cast<unsigned short>(w >> 16)));
++    const float a0 = h2f(p) * s, a1 = h2f(p >> 16) * s, b0 = h2f(q) * s, b1 = h2f(q >> 16) * s;
++    uint2 o;
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(o.x) : "f"(a1), "f"(a0));
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(o.y) : "f"(b1), "f"(b0));
++    return o;
++}
++
++// fp8 caches: a stage's raw bytes, K then V, 512 pieces of 16 codes each (piece e: key e >> 3, codes (e & 7) * 16).
++constexpr int kRaw = 2 * kKeys * kDim;
++
++// Keys kt..kt+63 of fp8 caches into raw stage `raw` (async, each thread its own 4 pieces), their scales into sc.
++__device__ __forceinline__ void issue8(uint8_t* raw, float* sc, const uint8_t* __restrict__ kc,
++                                       const uint8_t* __restrict__ vc, const float* __restrict__ ksc,
++                                       const float* __restrict__ vsc, long long off, int kv_heads, int ring,
++                                       int kvh, int kt, int k_lo, int k_hi) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const int e = threadIdx.x + kThreads * (i & 1), kp = kt + (e >> 3);
++        const bool in = kp >= k_lo && kp <= k_hi;
++        const size_t row = in ? static_cast<size_t>(kp % ring) * kv_heads + kvh : 0;
++        const uint8_t* src = (i < 2 ? kc : vc) + off + (in ? row * kDim + (e & 7) * 16 : 0);
++        const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(raw + (i >> 1) * kKeys * kDim + e * 16));
++        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(src), "r"(in ? 16 : 0));
++        sc[i] = in ? (i < 2 ? ksc : vsc)[off / kDim + row] : 0.0f;
++    }
++    asm volatile("cp.async.commit_group;\n" ::);
++}
++
++// This thread's pieces of raw stage `raw` as bf16 into the swizzled K/V tiles at `ks` (tile8's values, bit for bit).
++__device__ __forceinline__ void convert8(const uint8_t* raw, const float* sc, uint16_t* ks) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const int e = threadIdx.x + kThreads * (i & 1), key = e >> 3;
++        const uint4 w = *reinterpret_cast<const uint4*>(raw + (i >> 1) * kKeys * kDim + e * 16);
++        const uint2 a = deq4(w.x, sc[i]), b = deq4(w.y, sc[i]), c = deq4(w.z, sc[i]), d = deq4(w.w, sc[i]);
++        uint16_t* t = ks + (i >> 1) * kTile;
++        *reinterpret_cast<uint4*>(t + piece(key, 2 * (e & 7))) = make_uint4(a.x, a.y, b.x, b.y);
++        *reinterpret_cast<uint4*>(t + piece(key, 2 * (e & 7) + 1)) = make_uint4(c.x, c.y, d.x, d.y);
++    }
++}
++
++// A block's prompt pairs (tile of kPairs pairs, key head, chunk); KV8: raw fp8 in two stages, two bf16 tiles.
++template <bool KV8>
++__device__ __forceinline__ void promptTile(const uint16_t* __restrict__ q, const void* __restrict__ kc,
++                                           const void* __restrict__ vc, const uint16_t* __restrict__ tab,
++                                           const Seg* __restrict__ segs, float* __restrict__ part_o,
++                                           float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
++                                           int chunk, int c0, int chunks, float scale, const float* __restrict__ ksc,
++                                           const float* __restrict__ vsc, uint16_t* smem) {
++    const Seg s = segs[0];
+     const int group = heads / kv_heads;
+     const int total = s.n * group;
+     const int m0 = static_cast<int>(blockIdx.x) * kPairs;
+@@ -142,8 +192,23 @@ extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1)
+     // ldmatrix lanes: K rows 8j + (lane & 7), pieces 2k + lane / 8; V rows 16u + lane % 16, pieces n + lane / 16
+     const int k_row = lane & 7, k_pc = lane >> 3;
+     const int v_row = lane & 15, v_pc = lane >> 4;
+-    for (int st = 0; st < kStages - 1; ++st) {
+-        if (st < n_tiles) loadTile(smem + st * kStage, smem + st * kStage + kTile, kc, vc, head_base, ring,
++    const uint16_t* k16 = static_cast<const uint16_t*>(kc);
++    const uint16_t* v16 = static_cast<const uint16_t*>(vc);
++    const uint8_t* k8 = static_cast<const uint8_t*>(kc);
++    const uint8_t* v8 = static_cast<const uint8_t*>(vc);
++    uint8_t* raw = reinterpret_cast<uint8_t*>(smem + 2 * kStage);  // KV8: two raw stages after the two bf16 tiles
++    float cur[4], nxt[4];  // KV8: scales of the next tile to convert, and of the one after
++    if (KV8) {
++        issue8(raw, cur, k8, v8, ksc, vsc, s.off, kv_heads, ring, kvh, b_lo, b_lo, k_hi);
++        if (n_tiles > 1)
++            issue8(raw + kRaw, nxt, k8, v8, ksc, vsc, s.off, kv_heads, ring, kvh, b_lo + kKeys, b_lo, k_hi);
++        else asm volatile("cp.async.commit_group;\n" ::);
++        asm volatile("cp.async.wait_group 1;\n" ::);
++        convert8(raw, cur, smem);
++        for (int i = 0; i < 4; ++i) cur[i] = nxt[i];
++    }
++    for (int st = 0; !KV8 && st < kStages - 1; ++st) {
++        if (st < n_tiles) loadTile(smem + st * kStage, smem + st * kStage + kTile, k16, v16, head_base, ring,
+                                    b_lo + st * kKeys, b_lo, k_hi);
+         else asm volatile("cp.async.commit_group;\n" ::);
+     }
+@@ -155,15 +220,22 @@ extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1)
+             m[0] = m[1] = -INFINITY;
+             l[0] = l[1] = 0.0f;
+         }
+-        asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
+-        __syncthreads();  // tile `it` is in; every warp is past tile it-1, whose stage the next load takes
+-        if (it + kStages - 1 < n_tiles) {
+-            uint16_t* nx = smem + ((it + kStages - 1) % kStages) * kStage;
+-            loadTile(nx, nx + kTile, kc, vc, head_base, ring, kt + (kStages - 1) * kKeys, b_lo, k_hi);
++        if (KV8) {
++            __syncthreads();  // tile `it` is converted; every warp is past tile it-1 and its raw stage
++            if (it + 2 < n_tiles) issue8(raw + (it % 2) * kRaw, nxt, k8, v8, ksc, vsc, s.off, kv_heads, ring, kvh,
++                                         kt + 2 * kKeys, b_lo, k_hi);
++            else asm volatile("cp.async.commit_group;\n" ::);
+         } else {
+-            asm volatile("cp.async.commit_group;\n" ::);
++            asm volatile("cp.async.wait_group %0;\n" ::"n"(kStages - 2));
++            __syncthreads();  // tile `it` is in; every warp is past tile it-1, whose stage the next load takes
++            if (it + kStages - 1 < n_tiles) {
++                uint16_t* nx = smem + ((it + kStages - 1) % kStages) * kStage;
++                loadTile(nx, nx + kTile, k16, v16, head_base, ring, kt + (kStages - 1) * kKeys, b_lo, k_hi);
++            } else {
++                asm volatile("cp.async.commit_group;\n" ::);
++            }
+         }
+-        const uint16_t* ks = smem + (it % kStages) * kStage;
++        const uint16_t* ks = smem + (it % (KV8 ? 2 : kStages)) * kStage;
+         const uint16_t* vs = ks + kTile;
+         if (busy && kt <= w_last) {  // a tile past all of a warp's rows is an exact no-op
+             float sc[8][4];
+@@ -236,6 +308,11 @@ extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1)
+                 }
+             }
+         }
++        if (KV8 && it + 1 < n_tiles) {  // tile it+1's own bytes are in: to the bf16 tile computed next
++            asm volatile("cp.async.wait_group 1;\n" ::);
++            convert8(raw + ((it + 1) % 2) * kRaw, cur, smem + ((it + 1) % 2) * kStage);
++            for (int i = 0; i < 4; ++i) cur[i] = nxt[i];
++        }
+         if (busy && (it % (kSub / kKeys) == kSub / kKeys - 1 || it == n_tiles - 1)) {
+             for (int i = 0; i < 2; ++i) {
+                 l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+@@ -260,3 +337,25 @@ extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1)
+         for (int n = 0; n < 16; ++n) *reinterpret_cast<float2*>(o + 8 * n) = make_float2(O[n][2 * i], O[n][2 * i + 1]);
+     }
+ }
++
++}  // namespace ink2p
++
++#define TF_INK2_PROMPT_ARGS                                                                                       \
++    const uint16_t *__restrict__ q, const void *__restrict__ kc, const void *__restrict__ vc,                     \
++        const uint16_t *__restrict__ tab, const ink2p::Seg *__restrict__ segs, float *__restrict__ part_o,      \
++        float2 *__restrict__ part_ml, int heads, int kv_heads, int ring, int chunk, int c0, int chunks, float scale
++
++// One stream's prompt rows on a global layer with bf16 caches.
++extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1) tf_ink2_attn_prompt(TF_INK2_PROMPT_ARGS) {
++    extern __shared__ __align__(16) uint16_t smem[];
++    ink2p::promptTile<false>(q, kc, vc, tab, segs, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks, scale,
++                             nullptr, nullptr, smem);
++}
++
++// The same on fp8 caches (TF_INKLING2_KV=fp8): tiles dequantised as tf_ink2_attn8's, so the same bits.
++extern "C" __global__ void __launch_bounds__(ink2p::kThreads, 1)
++    tf_ink2_attn_prompt8(TF_INK2_PROMPT_ARGS, const float* __restrict__ ksc, const float* __restrict__ vsc) {
++    extern __shared__ __align__(16) uint16_t smem[];
++    ink2p::promptTile<true>(q, kc, vc, tab, segs, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks, scale,
++                            ksc, vsc, smem);
++}
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index f37ff01..6170e6b 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -16,7 +16,7 @@ pub const global_sub = 1024;
+ pub const subs = global_chunk / global_sub;
+ /// Most rows a call splits its global chunks for (beyond, the tiles fill the GPU without it).
+ pub const split_rows = 64;
+-/// A prompt block's (row, head) pairs (8 warps) and its three K/V tile stages (prompt_attention.cu kStages).
++/// A prompt block's (row, head) pairs (8 warps) and its three K/V tile stages (fp8: two raw stages, two bf16 tiles).
+ pub const prompt_pairs = 128;
+ pub const prompt_threads = 256;
+ pub const prompt_shared = 3 * 2 * tile_keys * head_dim * 2;
+@@ -106,6 +106,7 @@ pub const Kernels = struct {
+     attn_fold8: cuda.Function,
+     pmod: cuda.Module,
+     attn_prompt: cuda.Function,
++    attn_prompt8: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -115,10 +116,13 @@ pub const Kernels = struct {
+         errdefer pmod.unload();
+         const attn_prompt = try pmod.function("tf_ink2_attn_prompt");
+         try attn_prompt.allowDynamicShared(prompt_shared);
++        const attn_prompt8 = try pmod.function("tf_ink2_attn_prompt8");
++        try attn_prompt8.allowDynamicShared(prompt_shared);
+         return .{
+             .mod = mod,
+             .pmod = pmod,
+             .attn_prompt = attn_prompt,
++            .attn_prompt8 = attn_prompt8,
+             .prep = try mod.function("tf_ink2_prep"),
+             .rel_table = try mod.function("tf_ink2_rel_table"),
+             .attn = try mod.function("tf_ink2_attn"),
+@@ -211,13 +215,15 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+         a.add(int(1));
+         if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| a.add(v);
+         try go(if (l.kv8) k.attn8 else k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = slots_rh }, 128, &a);
+-    } else if (r.streams == 1 and !l.kv8) { // one stream's rows: 128 pairs a block share K/V tiles, the fold's bits
++    } else if (r.streams == 1) { // one stream's rows: 128 pairs a block share each K/V tile, the fold's bits
+         var p: cuda.Args = .{};
+         for ([_]u64{ q, kv.k, kv.v, tab, r.segs, part_o, part_ml }) |v| p.add(v);
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| p.add(int(v));
+         p.add(scale);
++        if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| p.add(v);
+         const blocks = std.math.divCeil(u32, r.rows * (r.heads / r.kv_heads), prompt_pairs) catch unreachable;
+-        try goShared(k.attn_prompt, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, prompt_shared, &p);
++        const f = if (l.kv8) k.attn_prompt8 else k.attn_prompt;
++        try goShared(f, s, .{ .x = blocks, .y = r.kv_heads, .z = stride }, prompt_threads, prompt_shared, &p);
+     } else { // a block a chunk, its sub-chunks folded in order
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| a.add(int(v));
+         a.add(scale);
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index 843a520..e235f54 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -38,9 +38,9 @@ test "inkling2 kernels: the loader type-checks in a build with kernels" {
+ }
+ 
+ const Fake = struct {
+-    var grids: [7][3]u32 = undefined;
+-    var blocks: [7]u32 = undefined;
+-    var shared: [7]u32 = undefined;
++    var grids: [8][3]u32 = undefined;
++    var blocks: [8]u32 = undefined;
++    var shared: [8]u32 = undefined;
+     var count: usize = 0;
+     fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, sh: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
+         const i = @intFromPtr(f) - 1;
+@@ -60,7 +60,7 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
+             return .{ .d = drv, .handle = @ptrFromInt(i) };
+         }
+     };
+-    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .prep8 = fun.of(&d, 5), .attn8 = fun.of(&d, 6), .attn_fold8 = fun.of(&d, 7), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3) };
++    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .prep8 = fun.of(&d, 5), .attn8 = fun.of(&d, 6), .attn_fold8 = fun.of(&d, 7), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3), .attn_prompt8 = fun.of(&d, 8) };
+     const s: cuda.Stream = .{ .d = &d, .handle = null };
+     const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
+     const l = k.Layer.global(1048576, false);
+@@ -97,10 +97,15 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
+     const kv8: k.Cache = .{ .k = 0, .v = 0, .ks = 64, .vs = 64 };
+     try k.prep(&kern, s, r, l8, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, kv8);
+     try k.attend(&kern, s, r, l8, 64, all, 0, kv8, 0, 0, 0, 0, 0, 0);
+-    try k.attend(&kern, s, r, l8, 64, all - 1, 0, kv8, 0, 0, 0, 0, 0, 0);
++    try k.attend(&kern, s, two, l8, 64, all - 1, 0, kv8, 0, 0, 0, 0, 0, 0);
+     try t.expectEqual([3]u32{ 1, 32, 1 }, Fake.grids[4]);
+     try t.expectEqual([3]u32{ 1, 4, 64 * k.subs }, Fake.grids[5]);
+     try t.expectEqual([3]u32{ 1, 4, 64 }, Fake.grids[6]);
++    // one stream's fp8 prompt rows: the fp8 prompt kernel, the bf16 one's grid and shared bytes
++    try k.attend(&kern, s, prompt, l8, 64, 2048 * 24 * 64, 0, kv8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 96, 4, 64 }, Fake.grids[7]);
++    try t.expectEqual(@as(u32, k.prompt_threads), Fake.blocks[7]);
++    try t.expectEqual(@as(u32, 98304), Fake.shared[7]);
+     var sl8 = k.Layer.sliding(1024, 1);
+     sl8.kv8 = true;
+     try t.expectError(error.Inkling2Kv8Sliding, k.attend(&kern, s, r, sl8, 64, all, 0, kv8, 0, 0, 0, 0, 0, 0));

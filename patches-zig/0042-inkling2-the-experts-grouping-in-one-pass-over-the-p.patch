@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:22:24 +1100
+Subject: [PATCH 42/45] inkling2: the experts' grouping in one pass over the
+ pairs, item list included
+
+tf_exl3_group compares every expert against every pick (3.9 ms a layer at 2,048 rows); the family's
+group counts a warp's share of the pairs, places them in pair order and writes the item list in the
+same launch. Same lists, same member order, so the layer output keeps its bits. Harness, 2,048 rows:
+3,862 -> 36 us a layer; 8 rows 18.9 -> 6.5 us.
+---
+ zig/kernels/cuda/inkling2/experts.cu  | 149 +++++++++++++++++---------
+ zig/src/families/inkling2/experts.zig |  25 ++---
+ 2 files changed, 107 insertions(+), 67 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/experts.cu b/zig/kernels/cuda/inkling2/experts.cu
+index 61acb12..e5b8afa 100644
+--- a/zig/kernels/cuda/inkling2/experts.cu
++++ b/zig/kernels/cuda/inkling2/experts.cu
+@@ -9,13 +9,15 @@ using namespace tf_exl3;
+ 
+ constexpr int ITEM_THREADS = 1024;
+ 
+-// Items (u, first, count): runs of at most `per` members of each distinct expert u, from tf_exl3_group's lists.
+-struct ItemArgs {
+-    const int* ucount; // int32 [1]
+-    const int* members; // int32 [nexp_max, maxm], -1 after the last member
+-    int* items; // int32 [3 * max items]
+-    int* nitems; // int32 [1]
+-    int maxm, per;
++// tf_ink2x_group's arguments: tf_exl3_group's lists, plus items (u, first, count), runs of at most `per` members.
++struct GroupArgs {
++    const int* pick; // int32 [rows * slots]
++    int* uids; // int32 [nexp_max]
++    int* ucount; // int32 [1]
++    int* members; // int32 [nexp_max, maxm]
++    int* items; // int32 [3 * max items] (per > 0)
++    int* nitems; // int32 [1] (per > 0)
++    int rows, slots, experts, maxm, per, pad; // pad: -1 after each expert's members up to maxm
+ };
+ 
+ // One projection; z, k, n, p, sk, maxm and slots as GroupedArgs has them.
+@@ -216,59 +218,104 @@ __device__ __forceinline__ void wide_body(const WideArgs a) {
+     }
+ }
+ 
+-}  // namespace ink2x
+-
+-extern "C" __global__ void __launch_bounds__(ink2x::ITEM_THREADS) tf_ink2x_items(const ink2x::ItemArgs a) {
+-    __shared__ int part[ink2x::ITEM_THREADS / 32];
+-    __shared__ int carry;
+-    const int n = a.ucount[0];
++// Exclusive sum over the block of one value a thread (ITEM_THREADS threads); `tot` gets the total.
++__device__ __forceinline__ int block_scan(int v, int* part, int& tot) {
+     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+-    if (threadIdx.x == 0) carry = 0;
++    int inc = v;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int x = __shfl_up_sync(0xffffffffu, inc, o);
++        if (lane >= o) inc += x;
++    }
++    if (lane == 31) part[warp] = inc;
+     __syncthreads();
+-    for (int base = 0; base < n; base += ink2x::ITEM_THREADS) {
+-        const int u = base + threadIdx.x;
+-        int cnt = 0;
+-        if (u < n) {  // members come first: the count is the first -1 (binary search), or maxm
+-            const int* m = a.members + (size_t)u * a.maxm;
+-            int lo = 0, hi = a.maxm;
+-            while (lo < hi) {
+-                const int mid = (lo + hi) >> 1;
+-                if (m[mid] >= 0) lo = mid + 1;
+-                else hi = mid;
+-            }
+-            cnt = lo;
+-        }
+-        const int k = (cnt + a.per - 1) / a.per;
+-        int inc = k;
++    if (warp == 0) {
++        const int w = part[lane];
++        int sum = w;
+ #pragma unroll
+         for (int o = 1; o < 32; o <<= 1) {
+-            const int v = __shfl_up_sync(0xffffffffu, inc, o);
+-            if (lane >= o) inc += v;
++            const int x = __shfl_up_sync(0xffffffffu, sum, o);
++            if (lane >= o) sum += x;
+         }
+-        if (lane == 31) part[warp] = inc;
+-        __syncthreads();
+-        if (warp == 0) {
+-            const int v = part[lane];
+-            int s = v;
+-#pragma unroll
+-            for (int o = 1; o < 32; o <<= 1) {
+-                const int x = __shfl_up_sync(0xffffffffu, s, o);
+-                if (lane >= o) s += x;
++        part[lane] = sum - w;
++        if (lane == 31) part[32] = sum;
++    }
++    __syncthreads();
++    tot = part[32];
++    const int r = part[warp] + inc - v;
++    __syncthreads();
++    return r;
++}
++
++}  // namespace ink2x
++
++// tf_exl3_group's lists and the item list in O(pairs): warp w counts, then places, its 32nd of the pairs in order.
++extern "C" __global__ void __launch_bounds__(ink2x::ITEM_THREADS) tf_ink2x_group(const ink2x::GroupArgs a) {
++    extern __shared__ int sh[];
++    __shared__ int part[33];
++    const int E = a.experts, n = a.rows * a.slots;
++    uint16_t* wc = reinterpret_cast<uint16_t*>(sh);  // [32][E]: a warp's pairs of each expert, then its first rank
++    int* cnt = sh + 16 * E;
++    int* uidx = cnt + E;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int span = (n + 31) / 32, lo = warp * span, hi = min(n, lo + span);
++    const unsigned below = (1u << lane) - 1u;
++    for (int i = threadIdx.x; i < 32 * E; i += ink2x::ITEM_THREADS) wc[i] = 0;
++    __syncthreads();
++    for (int i0 = lo; i0 < hi; i0 += 32) {
++        const int i = i0 + lane;
++        const int e = i < hi ? a.pick[i] : -1;
++        const unsigned m = __match_any_sync(0xffffffffu, e);
++        if (e >= 0 && e < E && (m & below) == 0) wc[warp * E + e] += __popc(m);
++    }
++    __syncthreads();
++    int has = 0, k = 0, c = 0;
++    const int e = threadIdx.x;
++    if (e < E) {
++        for (int w = 0; w < 32; ++w) {
++            const int t = wc[w * E + e];
++            wc[w * E + e] = c;
++            c += t;
++        }
++        cnt[e] = c;
++        has = c > 0;
++        k = a.per > 0 ? (c + a.per - 1) / a.per : 0;
++    }
++    int nu, ni;
++    const int u = ink2x::block_scan(has, part, nu);
++    int it = ink2x::block_scan(k, part, ni);
++    if (e < E) {
++        uidx[e] = u;
++        if (has) {
++            a.uids[u] = e;
++            for (int j = 0; j < k; ++j, ++it) {
++                a.items[3 * it] = u;
++                a.items[3 * it + 1] = j * a.per;
++                a.items[3 * it + 2] = min(a.per, c - j * a.per);
+             }
+-            part[lane] = s - v;
+         }
+-        __syncthreads();
+-        int at = carry + part[warp] + inc - k;
+-        for (int j = 0; j < k; ++j, ++at) {
+-            a.items[3 * at] = u;
+-            a.items[3 * at + 1] = j * a.per;
+-            a.items[3 * at + 2] = min(a.per, cnt - j * a.per);
++    }
++    if (threadIdx.x == 0) {
++        a.ucount[0] = nu;
++        if (a.per > 0) a.nitems[0] = ni;
++    }
++    __syncthreads();
++    for (int i0 = lo; i0 < hi; i0 += 32) {
++        const int i = i0 + lane;
++        const int pe = i < hi ? a.pick[i] : -1;
++        const unsigned m = __match_any_sync(0xffffffffu, pe);
++        if (pe >= 0 && pe < E) {
++            const int rank = wc[warp * E + pe] + __popc(m & below);
++            a.members[(size_t)uidx[pe] * a.maxm + rank] = (i / a.slots) * 32 + i % a.slots;
+         }
+-        __syncthreads();
+-        if (threadIdx.x == ink2x::ITEM_THREADS - 1) carry = at;
+-        __syncthreads();
++        __syncwarp();
++        if (pe >= 0 && pe < E && (m & below) == 0) wc[warp * E + pe] += __popc(m);
++        __syncwarp();
+     }
+-    if (threadIdx.x == 0) a.nitems[0] = carry;
++    if (a.pad)  // -1 after each expert's members, as tf_exl3_group leaves them
++        for (int x = threadIdx.x; x < E; x += ink2x::ITEM_THREADS)
++            if (cnt[x] > 0)
++                for (int j = cnt[x]; j < a.maxm; ++j) a.members[(size_t)uidx[x] * a.maxm + j] = -1;
+ }
+ 
+ // Decode rows and short windows: 128 columns and 16 members a block (grouped_body's tile), warp sums apart.
+diff --git a/zig/src/families/inkling2/experts.zig b/zig/src/families/inkling2/experts.zig
+index 1e2cbd9..1026018 100644
+--- a/zig/src/families/inkling2/experts.zig
++++ b/zig/src/families/inkling2/experts.zig
+@@ -1,4 +1,4 @@
+-//! Inkling 2's routed experts: main's grouping and combine, the family's grouped projections and softcapped SwiGLU.
++//! Inkling 2's routed experts: the family's grouping and grouped projections, main's rotation and combine.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const ops = @import("ops.zig");
+@@ -17,7 +17,7 @@ pub const wide_from = 512;
+ pub const Kernels = struct {
+     main: ex.Experts,
+     mod: cuda.Module,
+-    items: cuda.Function,
++    group: cuda.Function,
+     rows: cuda.Function,
+     wide: cuda.Function,
+ 
+@@ -29,7 +29,7 @@ pub const Kernels = struct {
+         return .{
+             .main = main,
+             .mod = mod,
+-            .items = try mod.function("tf_ink2x_items"),
++            .group = try mod.function("tf_ink2x_group"),
+             .rows = try mod.function("tf_ink2x_rows"),
+             .wide = try mod.function("tf_ink2x_wide"),
+         };
+@@ -72,28 +72,21 @@ pub fn run(e: *const Kernels, k: *const ops.Kernels, s: cuda.Stream, l: ex.Layer
+     const w = l.width;
+     const slots = sc.slots;
+     if (rows < 1 or rows > sc.rows or slots < 1 or slots > 32) return error.BadExperts;
+-    if (l.experts < 1 or l.experts > 4096 or l.codebook != .mul1 or l.gu_stride != 0) return error.BadExperts;
++    if (l.experts < 1 or l.experts > 512 or l.codebook != .mul1 or l.gu_stride != 0) return error.BadExperts;
+     const g_sk = try ex.plan(d, w, true);
+     const d_sk = try ex.plan(w, d, false);
+     const p = rows * slots;
+     const maxu = @min(p, l.experts);
+ 
+-    var a: cuda.Args = .{};
+-    for ([_]u64{ pick, sc.ids, sc.count, sc.members }) |v| a.add(v);
+-    for ([_]usize{ rows, slots, l.experts, rows }) |v| a.add(i32d(v));
+-    const shared: u32 = @intCast(rows * slots * 4);
+-    try cuda.launch.launch(e.main.group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = shared }, s, &a);
+-
+     const listed = rows >= listed_from;
+     const wide = rows >= wide_from;
+     const per: usize = if (wide) 32 else 16;
+     const at = itemsAt(l, sc);
+-    if (listed) {
+-        var it: cuda.Args = .{};
+-        for ([_]u64{ sc.count, sc.members, at + 256, at }) |v| it.add(v);
+-        for ([_]usize{ rows, per }) |v| it.add(i32d(v));
+-        try cuda.launch.launch(e.items, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, s, &it);
+-    }
++    var a: cuda.Args = .{};
++    for ([_]u64{ pick, sc.ids, sc.count, sc.members, at + 256, at }) |v| a.add(v);
++    for ([_]usize{ rows, slots, l.experts, rows, if (listed) per else 0, @intFromBool(!listed) }) |v| a.add(i32d(v));
++    const shared: u32 = @intCast(l.experts * (32 * 2 + 2 * 4)); // per-warp uint16 counts, then counts and places
++    try cuda.launch.launch(e.group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = shared }, s, &a);
+     const items: u64 = if (listed) at + 256 else 0;
+     const count: u64 = if (listed) at else sc.count;
+     const gy: u32 = @intCast(if (listed) (p + per - 1) / per + maxu else maxu);

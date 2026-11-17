@@ -1,0 +1,540 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:11:13 +1100
+Subject: [PATCH 41/45] inkling2: grouped experts on the family's own kernels,
+ no empty tiles and the same bits
+
+Prompt chunks list each expert's members in runs (an item list) instead of launching a tile for
+every possible 16-row group, and wide calls take 32 members by 64 columns a block. Each output keeps
+main's k order, splits and warp sums, so z, xd and the layer output are bit-identical to
+tf_exl3_grouped_2 (harness checksums at 1 to 2,048 rows). Harness, one rank, 2,048 rows: grouped
+gate/up + down 57.7 -> 20.9 ms a layer; 1 row 182 -> 174 us.
+---
+ zig/build/cuda_kernels.zig            |   1 +
+ zig/kernels/cuda/inkling2/experts.cu  | 282 ++++++++++++++++++++++++++
+ zig/src/cuda/kernels.zig              |   1 +
+ zig/src/families/inkling2/experts.zig | 127 ++++++++++--
+ zig/src/families/inkling2/forward.zig |   6 +-
+ 5 files changed, 397 insertions(+), 20 deletions(-)
+ create mode 100644 zig/kernels/cuda/inkling2/experts.cu
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index bfb30af..84aa2e6 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -150,6 +150,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "inkling2_attn", .src = "inkling2/attention", .flags = &.{"-O3"} }, // ours: Inkling 2's relative-bias attention
+     .{ .name = "inkling2_ops", .src = "inkling2/ops", .flags = glue }, // ours: Inkling 2's residual mix, convs, router, SwiGLU
+     .{ .name = "inkling2_rows", .src = "inkling2/rows", .flags = glue }, // ours: Inkling 2's router row dots on prompt rows
++    .{ .name = "inkling2_experts", .src = "inkling2/experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours: Inkling 2's grouped experts
+     .{ .name = "inkling2_dspark", .src = "inkling2/dspark", .flags = glue }, // ours: Inkling 2's DSpark drafter glue
+     .{ .name = "inkling2_vision", .src = "inkling2/vision", .flags = glue }, // ours: Inkling 2's vision tower glue and attention
+     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+diff --git a/zig/kernels/cuda/inkling2/experts.cu b/zig/kernels/cuda/inkling2/experts.cu
+new file mode 100644
+index 0000000..61acb12
+--- /dev/null
++++ b/zig/kernels/cuda/inkling2/experts.cu
+@@ -0,0 +1,282 @@
++// Inkling 2's grouped expert projections: exl3_grouped.cuh's arithmetic per output, launched without empty tiles.
++#include <cstdint>
++#include <cuda_fp16.h>
++
++#include "exl3_decode.cuh"
++
++namespace ink2x {
++using namespace tf_exl3;
++
++constexpr int ITEM_THREADS = 1024;
++
++// Items (u, first, count): runs of at most `per` members of each distinct expert u, from tf_exl3_group's lists.
++struct ItemArgs {
++    const int* ucount; // int32 [1]
++    const int* members; // int32 [nexp_max, maxm], -1 after the last member
++    int* items; // int32 [3 * max items]
++    int* nitems; // int32 [1]
++    int maxm, per;
++};
++
++// One projection; z, k, n, p, sk, maxm and slots as GroupedArgs has them.
++struct WideArgs {
++    const half* x0; // fp16 [P, K], the rotated gate (or down) inputs
++    const half* x1; // fp16 [P, K], the rotated up inputs
++    const long long* tp0; // int64 [E], one trellis pointer per expert
++    const long long* tp1;
++    const int* k2_0; // int32 [E], half-bits a value
++    const int* k2_1;
++    const int* uids; // int32 [nexp_max], distinct routed experts in id order
++    const int* items; // int32 [3 * max items], (u, first member, count); null: item u is expert u, maxm <= 16 MT
++    const int* nitems; // int32 [1]: the items, or the group's count when items is null
++    const int* members; // int32 [nexp_max, maxm], row * 32 + slot
++    float* z; // fp32 partials, [(mat * sk + split) * P + p] * N + col
++    int k, n, p, sk, maxm, slots;
++};
++
++// A warp's k tiles for MT member tiles in grouped_body's order per output; words and inputs travel a tile ahead.
++template <int CB, int K2, int NT, int MT>
++struct Tiles {
++    static constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
++    uint32_t nx[NT][LW];
++
++    __device__ __forceinline__ void first(const uint32_t* tb, int nkt, int lane) {
++        if (nkt > 0)
++#pragma unroll
++            for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(tb + j * TW, lane, nx[j]);
++    }
++
++    __device__ __forceinline__ static void xload(const half* (&xr)[MT][2], const bool (&ok)[MT][2], int mts, int k,
++                                                 uint32_t (&a)[MT][4]) {
++#pragma unroll
++        for (int m = 0; m < MT; ++m) {
++            const bool o0 = m < mts && ok[m][0], o1 = m < mts && ok[m][1];
++            a[m][0] = o0 ? *reinterpret_cast<const uint32_t*>(xr[m][0] + k) : 0u;
++            a[m][1] = o1 ? *reinterpret_cast<const uint32_t*>(xr[m][1] + k) : 0u;
++            a[m][2] = o0 ? *reinterpret_cast<const uint32_t*>(xr[m][0] + k + 8) : 0u;
++            a[m][3] = o1 ? *reinterpret_cast<const uint32_t*>(xr[m][1] + k + 8) : 0u;
++        }
++    }
++
++    __device__ __forceinline__ void run(const uint32_t* tb, size_t kstride, int kt0, int nkt, const half* (&xr)[MT][2],
++                                        const bool (&ok)[MT][2], int mts, int lane, float (&acc)[MT][NT][2][4]) {
++        uint32_t xa[MT][4];
++        if (nkt > 0) xload(xr, ok, mts, kt0 * 16, xa);
++        for (int i = 0; i < nkt; ++i) {
++            uint32_t w[NT][LW], a[MT][4];
++#pragma unroll
++            for (int j = 0; j < NT; ++j)
++#pragma unroll
++                for (int l = 0; l < LW; ++l) w[j][l] = nx[j][l];
++#pragma unroll
++            for (int m = 0; m < MT; ++m)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) a[m][c] = xa[m][c];
++            if (i + 1 < nkt) {
++#pragma unroll
++                for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(tb + (size_t)(i + 1) * kstride + j * TW, lane, nx[j]);
++                xload(xr, ok, mts, (kt0 + i + 1) * 16, xa);
++            }
++#pragma unroll
++            for (int j = 0; j < NT; ++j) {
++                uint32_t b0[2], b1[2];
++                decode_lane<K2, CB>(w[j], lane, b0, b1);
++#pragma unroll
++                for (int m = 0; m < MT; ++m)
++                    if (m < mts) {
++                        mma16816(acc[m][j][0], a[m], b0);
++                        mma16816(acc[m][j][1], a[m], b1);
++                    }
++            }
++        }
++    }
++};
++
++// This lane's member-row input pointers (rows_sh filled and synced).
++template <int MT>
++__device__ __forceinline__ void member_rows(const half* X, int k, const int* rows_sh, int mts, int g, int t,
++                                            const half* (&xr)[MT][2], bool (&ok)[MT][2]) {
++#pragma unroll
++    for (int m = 0; m < MT; ++m) {
++        const int r0 = m < mts ? rows_sh[16 * m + g] : -1, r1 = m < mts ? rows_sh[16 * m + g + 8] : -1;
++        xr[m][0] = X + (size_t)(r0 < 0 ? 0 : r0) * k + 2 * t;
++        xr[m][1] = X + (size_t)(r1 < 0 ? 0 : r1) * k + 2 * t;
++        ok[m][0] = r0 >= 0;
++        ok[m][1] = r1 >= 0;
++    }
++}
++
++// Program (n block, item, mat * sk + split): 16 MT members by W_q over the split's K; SEQ: warps add in turn.
++template <int CB, int NT, int MT, int W, bool SEQ>
++__device__ __forceinline__ void wide_body(const WideArgs a) {
++    const int nblock = blockIdx.x, item = blockIdx.y;
++    if (item >= a.nitems[0]) return;
++    int u = item, first = 0, cnt = a.maxm;
++    if (a.items) {
++        u = a.items[3 * item];
++        first = a.items[3 * item + 1];
++        cnt = a.items[3 * item + 2];
++    }
++    const int split = blockIdx.z % a.sk, mat = blockIdx.z / a.sk;
++    const half* X = mat ? a.x1 : a.x0;
++    const int e = a.uids[u];
++    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? a.tp1[e] : a.tp0[e]);
++    const int k2 = mat ? a.k2_1[e] : a.k2_0[e];
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int g = lane >> 2, t = lane & 3;
++    const int ntiles = a.n >> 4;
++    const int per_warp = (a.k >> 4) / a.sk / W;
++    const int kt0 = split * (per_warp * W) + warp * per_warp;
++    const int nt0 = nblock * NT;
++
++    __shared__ int rows_sh[16 * MT];
++    for (int m = threadIdx.x; m < 16 * MT; m += W * 32) {
++        const int code = m < cnt ? a.members[(size_t)u * a.maxm + first + m] : -1;
++        rows_sh[m] = code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1;
++    }
++    float acc[MT][NT][2][4];
++#pragma unroll
++    for (int m = 0; m < MT; ++m)
++#pragma unroll
++        for (int i = 0; i < NT; ++i)
++#pragma unroll
++            for (int h = 0; h < 2; ++h)
++#pragma unroll
++                for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
++
++    int mts = 0;
++    switch (k2) {  // the first k tile's words are in flight before the members' rows are read
++#define TF_INK2X_CASE(K2_)                                                                               \
++    case K2_: {                                                                                          \
++        Tiles<CB, K2_, NT, MT> tl;                                                                       \
++        const size_t kstride = (size_t)ntiles * tile_words<K2_>();                                       \
++        const uint32_t* tb = T + (size_t)kt0 * kstride + (size_t)nt0 * tile_words<K2_>();                \
++        tl.first(tb, per_warp, lane);                                                                    \
++        __syncthreads();                                                                                 \
++        if (!a.items)                                                                                    \
++            while (cnt > 0 && rows_sh[cnt - 1] < 0) --cnt;                                               \
++        mts = (cnt + 15) >> 4;                                                                           \
++        if (mts == 0) return;                                                                            \
++        const half* xr[MT][2];                                                                           \
++        bool ok[MT][2];                                                                                  \
++        member_rows<MT>(X, a.k, rows_sh, mts, g, t, xr, ok);                                             \
++        tl.run(tb, kstride, kt0, per_warp, xr, ok, mts, lane, acc);                                      \
++        break;                                                                                           \
++    }
++        TF_INK2X_CASE(2)
++        TF_INK2X_CASE(3)
++        TF_INK2X_CASE(4)
++        TF_INK2X_CASE(5)
++        TF_INK2X_CASE(6)
++        TF_INK2X_CASE(7)
++        TF_INK2X_CASE(8)
++#undef TF_INK2X_CASE
++        default:
++            __trap();
++    }
++
++    __shared__ __align__(16) float red[SEQ ? 1 : W][16][NT * 16];
++#pragma unroll
++    for (int m = 0; m < MT; ++m) {
++        if (m >= mts) break;
++        if (m) __syncthreads();  // the last tile's sums are read
++        for (int w = SEQ ? 0 : warp; w < (SEQ ? W : warp + 1); ++w) {
++            if (w == warp)
++#pragma unroll
++                for (int i = 0; i < NT; ++i)
++#pragma unroll
++                    for (int h = 0; h < 2; ++h) {
++                        const int col = i * 16 + h * 8 + 2 * t;
++                        float* p0 = &red[SEQ ? 0 : warp][g][col];
++                        float* p1 = &red[SEQ ? 0 : warp][g + 8][col];
++                        if (!SEQ || w == 0) {
++                            p0[0] = acc[m][i][h][0];
++                            p0[1] = acc[m][i][h][1];
++                            p1[0] = acc[m][i][h][2];
++                            p1[1] = acc[m][i][h][3];
++                        } else {
++                            p0[0] += acc[m][i][h][0];
++                            p0[1] += acc[m][i][h][1];
++                            p1[0] += acc[m][i][h][2];
++                            p1[1] += acc[m][i][h][3];
++                        }
++                    }
++            if (SEQ) __syncthreads();
++        }
++        if (!SEQ) __syncthreads();
++        for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
++            const int row = idx / (NT * 16), col = idx % (NT * 16);
++            const int r = rows_sh[16 * m + row];
++            if (r < 0) continue;
++            float s = red[0][row][col];
++#pragma unroll
++            for (int w = 1; w < (SEQ ? 1 : W); ++w) s += red[w][row][col];
++            a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = s;
++        }
++    }
++}
++
++}  // namespace ink2x
++
++extern "C" __global__ void __launch_bounds__(ink2x::ITEM_THREADS) tf_ink2x_items(const ink2x::ItemArgs a) {
++    __shared__ int part[ink2x::ITEM_THREADS / 32];
++    __shared__ int carry;
++    const int n = a.ucount[0];
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    if (threadIdx.x == 0) carry = 0;
++    __syncthreads();
++    for (int base = 0; base < n; base += ink2x::ITEM_THREADS) {
++        const int u = base + threadIdx.x;
++        int cnt = 0;
++        if (u < n) {  // members come first: the count is the first -1 (binary search), or maxm
++            const int* m = a.members + (size_t)u * a.maxm;
++            int lo = 0, hi = a.maxm;
++            while (lo < hi) {
++                const int mid = (lo + hi) >> 1;
++                if (m[mid] >= 0) lo = mid + 1;
++                else hi = mid;
++            }
++            cnt = lo;
++        }
++        const int k = (cnt + a.per - 1) / a.per;
++        int inc = k;
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int v = __shfl_up_sync(0xffffffffu, inc, o);
++            if (lane >= o) inc += v;
++        }
++        if (lane == 31) part[warp] = inc;
++        __syncthreads();
++        if (warp == 0) {
++            const int v = part[lane];
++            int s = v;
++#pragma unroll
++            for (int o = 1; o < 32; o <<= 1) {
++                const int x = __shfl_up_sync(0xffffffffu, s, o);
++                if (lane >= o) s += x;
++            }
++            part[lane] = s - v;
++        }
++        __syncthreads();
++        int at = carry + part[warp] + inc - k;
++        for (int j = 0; j < k; ++j, ++at) {
++            a.items[3 * at] = u;
++            a.items[3 * at + 1] = j * a.per;
++            a.items[3 * at + 2] = min(a.per, cnt - j * a.per);
++        }
++        __syncthreads();
++        if (threadIdx.x == ink2x::ITEM_THREADS - 1) carry = at;
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) a.nitems[0] = carry;
++}
++
++// Decode rows and short windows: 128 columns and 16 members a block (grouped_body's tile), warp sums apart.
++extern "C" __global__ void __launch_bounds__(128) tf_ink2x_rows(const ink2x::WideArgs a) {
++    ink2x::wide_body<tf_exl3::CB_MUL1, 8, 1, 4, false>(a);
++}
++
++// Prompt chunks: 64 columns and 32 members a block, one sum buffer.
++extern "C" __global__ void __launch_bounds__(128) tf_ink2x_wide(const ink2x::WideArgs a) {
++    ink2x::wide_body<tf_exl3::CB_MUL1, 4, 2, 4, true>(a);
++}
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 023ae98..e629805 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -83,6 +83,7 @@ pub const minimax_m3_attn: []const u8 = if (available) &Blob("fatbin_minimax_m3_
+ pub const inkling2_attn: []const u8 = if (available) &Blob("fatbin_inkling2_attn").bytes else &.{};
+ pub const inkling2_ops: []const u8 = if (available) &Blob("fatbin_inkling2_ops").bytes else &.{};
+ pub const inkling2_rows: []const u8 = if (available) &Blob("fatbin_inkling2_rows").bytes else &.{};
++pub const inkling2_experts: []const u8 = if (available) &Blob("fatbin_inkling2_experts").bytes else &.{};
+ pub const inkling2_dspark: []const u8 = if (available) &Blob("fatbin_inkling2_dspark").bytes else &.{};
+ pub const inkling2_vision: []const u8 = if (available) &Blob("fatbin_inkling2_vision").bytes else &.{};
+ pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes else &.{};
+diff --git a/zig/src/families/inkling2/experts.zig b/zig/src/families/inkling2/experts.zig
+index da82c05..1e2cbd9 100644
+--- a/zig/src/families/inkling2/experts.zig
++++ b/zig/src/families/inkling2/experts.zig
+@@ -1,4 +1,4 @@
+-//! Inkling 2's routed experts on main's grouped EXL3 kernels, the gate/up epilogue swapped for the softcapped SwiGLU.
++//! Inkling 2's routed experts: main's grouping and combine, the family's grouped projections and softcapped SwiGLU.
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const ops = @import("ops.zig");
+@@ -8,26 +8,97 @@ const ex = cuda.exl3_experts;
+ /// The two SwiGLU softcaps (config.json mlp_gate_softcap, mlp_up_softcap).
+ pub const Caps = struct { gate: f32, up: f32 };
+ 
++/// Calls of at least this many rows take an item list (runs of one expert's members), not one item an expert.
++pub const listed_from = 17;
++/// Calls of at least this many rows take the prompt kernel (32 members by 64 columns a block).
++pub const wide_from = 512;
++
++/// main's experts module beside the family's grouped projections.
++pub const Kernels = struct {
++    main: ex.Experts,
++    mod: cuda.Module,
++    items: cuda.Function,
++    rows: cuda.Function,
++    wide: cuda.Function,
++
++    pub fn load(d: *const cuda.Driver) !Kernels {
++        var main = try ex.Experts.load(d);
++        errdefer main.unload();
++        var mod = try cuda.Module.load(d, cuda.kernels.inkling2_experts);
++        errdefer mod.unload();
++        return .{
++            .main = main,
++            .mod = mod,
++            .items = try mod.function("tf_ink2x_items"),
++            .rows = try mod.function("tf_ink2x_rows"),
++            .wide = try mod.function("tf_ink2x_wide"),
++        };
++    }
++
++    pub fn unload(k: *Kernels) void {
++        k.mod.unload();
++        k.main.unload();
++    }
++};
++
+ fn i32d(v: usize) i32 {
+     return @intCast(v);
+ }
+ 
+-/// exl3_experts.Experts.run's launches in its order, ops.cu's tf_ink2_gateup in place of the shared epilogue.
+-pub fn run(e: *const ex.Experts, k: *const ops.Kernels, s: cuda.Stream, l: ex.Layer, caps: Caps, x: u64, x_stride: usize, x_dtype: ex.DType, pick: u64, wts: u64, rows: usize, out: u64, sc: ex.Scratch) !void {
++fn align256(n: usize) usize {
++    return (n + 255) / 256 * 256;
++}
++
++/// Items at most a call of `rows` rows lists: runs of 16 members, plus one partial run a distinct expert.
++fn maxItems(l: ex.Layer, rows: usize, slots: usize) usize {
++    const p = rows * slots;
++    return (p + 15) / 16 + @min(p, l.experts);
++}
++
++/// main's scratch, then the item count and the item list (three int32 an item).
++pub fn scratchBytes(l: ex.Layer, rows: usize, slots: usize) !usize {
++    return try ex.scratchBytes(l, rows, slots) + 256 + align256(maxItems(l, rows, slots) * 12);
++}
++
++/// Where the item count sits in scratch laid out by ex.scratch over scratchBytes(); the list follows 256 bytes on.
++fn itemsAt(l: ex.Layer, sc: ex.Scratch) u64 {
++    return sc.members + align256(@min(sc.rows * sc.slots, l.experts) * sc.rows * 4);
++}
++
++/// exl3_experts.Experts.run's launches in its order: the family's grouped projections, ops.cu's tf_ink2_gateup.
++pub fn run(e: *const Kernels, k: *const ops.Kernels, s: cuda.Stream, l: ex.Layer, caps: Caps, x: u64, x_stride: usize,
++    x_dtype: ex.DType, pick: u64, wts: u64, rows: usize, out: u64, sc: ex.Scratch) !void {
+     const d = l.dims;
+     const w = l.width;
+     const slots = sc.slots;
+-    if (rows < 1 or rows > sc.rows or slots < 1 or slots > 32 or l.experts < 1 or l.experts > 4096) return error.BadExperts;
++    if (rows < 1 or rows > sc.rows or slots < 1 or slots > 32) return error.BadExperts;
++    if (l.experts < 1 or l.experts > 4096 or l.codebook != .mul1 or l.gu_stride != 0) return error.BadExperts;
+     const g_sk = try ex.plan(d, w, true);
+     const d_sk = try ex.plan(w, d, false);
+     const p = rows * slots;
+     const maxu = @min(p, l.experts);
+-    const mt = (rows + 15) / 16;
+ 
+     var a: cuda.Args = .{};
+     for ([_]u64{ pick, sc.ids, sc.count, sc.members }) |v| a.add(v);
+     for ([_]usize{ rows, slots, l.experts, rows }) |v| a.add(i32d(v));
+-    try cuda.launch.launch(e.group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = @intCast(rows * slots * 4) }, s, &a);
++    const shared: u32 = @intCast(rows * slots * 4);
++    try cuda.launch.launch(e.main.group, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 }, .shared = shared }, s, &a);
++
++    const listed = rows >= listed_from;
++    const wide = rows >= wide_from;
++    const per: usize = if (wide) 32 else 16;
++    const at = itemsAt(l, sc);
++    if (listed) {
++        var it: cuda.Args = .{};
++        for ([_]u64{ sc.count, sc.members, at + 256, at }) |v| it.add(v);
++        for ([_]usize{ rows, per }) |v| it.add(i32d(v));
++        try cuda.launch.launch(e.items, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, s, &it);
++    }
++    const items: u64 = if (listed) at + 256 else 0;
++    const count: u64 = if (listed) at else sc.count;
++    const gy: u32 = @intCast(if (listed) (p + per - 1) / per + maxu else maxu);
++    const f = if (wide) e.wide else e.rows;
++    const cols: usize = if (wide) 64 else 128;
+ 
+     var r: cuda.Args = .{};
+     r.add(x);
+@@ -35,26 +106,32 @@ pub fn run(e: *const ex.Experts, k: *const ops.Kernels, s: cuda.Stream, l: ex.La
+     r.add(@as(i32, @backingInt(x_dtype)));
+     for ([_]u64{ pick, l.suh_g, l.suh_u, sc.xg, sc.xu }) |v| r.add(v);
+     for ([_]usize{ d, slots, l.experts }) |v| r.add(i32d(v));
+-    try cuda.launch.launch(e.rot_in, .{ .grid = .{ .x = @intCast(p), .y = @intCast(d / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &r);
++    const rot: cuda.Dim3 = .{ .x = @intCast(p), .y = @intCast(d / 128), .z = 2 };
++    try cuda.launch.launch(e.main.rot_in, .{ .grid = rot, .block = .{ .x = 32 } }, s, &r);
+ 
+     var g: cuda.Args = .{};
+-    for ([_]u64{ sc.xg, sc.xu, l.gate, l.up, l.gate_k2, l.up_k2, sc.ids, sc.count, sc.members, sc.z }) |v| g.add(v);
+-    for ([_]usize{ d, w, p, g_sk, rows, slots, maxu }) |v| g.add(i32d(v));
+-    for ([_]i32{ 2, i32d(l.gu_stride), 0, -1 }) |v| g.add(v);
+-    try cuda.launch.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128 } }, s, &g);
++    for ([_]u64{ sc.xg, sc.xu, l.gate, l.up, l.gate_k2, l.up_k2, sc.ids }) |v| g.add(v);
++    for ([_]u64{ items, count, sc.members, sc.z }) |v| g.add(v);
++    for ([_]usize{ d, w, p, g_sk, rows, slots }) |v| g.add(i32d(v));
++    const gu: cuda.Dim3 = .{ .x = @intCast(w / cols), .y = gy, .z = @intCast(2 * g_sk) };
++    try cuda.launch.launch(f, .{ .grid = gu, .block = .{ .x = 128 } }, s, &g);
+ 
+-    try ops.gateup(k, s, .{ .z = sc.z, .pick = pick, .svh_g = l.svh_g, .svh_u = l.svh_u, .suh_d = l.suh_d, .xd = sc.xd, .p = i32d(p), .n = i32d(w), .sk = i32d(g_sk), .experts = i32d(l.experts), .gate_cap = caps.gate, .up_cap = caps.up });
++    try ops.gateup(k, s, .{ .z = sc.z, .pick = pick, .svh_g = l.svh_g, .svh_u = l.svh_u, .suh_d = l.suh_d, .xd = sc.xd,
++        .p = i32d(p), .n = i32d(w), .sk = i32d(g_sk), .experts = i32d(l.experts), .gate_cap = caps.gate,
++        .up_cap = caps.up });
+ 
+     var dn: cuda.Args = .{};
+-    for ([_]u64{ sc.xd, sc.xd, l.down, l.down, l.down_k2, l.down_k2, sc.ids, sc.count, sc.members, sc.z }) |v| dn.add(v);
+-    for ([_]usize{ w, d, p, d_sk, rows, slots, maxu }) |v| dn.add(i32d(v));
+-    for ([_]i32{ 1, 0, 0, -1 }) |v| dn.add(v);
+-    try cuda.launch.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128 } }, s, &dn);
++    for ([_]u64{ sc.xd, sc.xd, l.down, l.down, l.down_k2, l.down_k2, sc.ids }) |v| dn.add(v);
++    for ([_]u64{ items, count, sc.members, sc.z }) |v| dn.add(v);
++    for ([_]usize{ w, d, p, d_sk, rows, slots }) |v| dn.add(i32d(v));
++    const down: cuda.Dim3 = .{ .x = @intCast(d / cols), .y = gy, .z = @intCast(d_sk) };
++    try cuda.launch.launch(f, .{ .grid = down, .block = .{ .x = 128 } }, s, &dn);
+ 
+     var cb: cuda.Args = .{};
+     for ([_]u64{ sc.z, pick, l.svh_d, sc.y, wts, out }) |v| cb.add(v);
+     for ([_]usize{ p, d, d_sk, l.experts, slots }) |v| cb.add(i32d(v));
+-    try cuda.launch.launch(e.down_combine, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(d / 128) }, .block = .{ .x = @intCast(32 * slots) } }, s, &cb);
++    const comb: cuda.Dim3 = .{ .x = @intCast(rows), .y = @intCast(d / 128) };
++    try cuda.launch.launch(e.main.down_combine, .{ .grid = comb, .block = .{ .x = @intCast(32 * slots) } }, s, &cb);
+ }
+ 
+ test "experts: Inkling's expert shapes have built tiles (gate/up 4608 -> 2304 whole and a rank's 1152, down back)" {
+@@ -63,3 +140,19 @@ test "experts: Inkling's expert shapes have built tiles (gate/up 4608 -> 2304 wh
+     _ = try ex.plan(2304, 4608, false);
+     _ = try ex.plan(1152, 4608, false);
+ }
++
++test "experts: the item list sits past main's scratch and holds a 2,048-row call's items" {
++    var l = std.mem.zeroes(ex.Layer);
++    l.experts = 384;
++    l.dims = 4608;
++    l.width = 1152;
++    l.codebook = .mul1;
++    const bytes = try scratchBytes(l, 2048, 8);
++    const sc = try ex.scratch(0, l, 2048, 8);
++    const at = itemsAt(l, sc);
++    try std.testing.expectEqual(@as(u64, try ex.scratchBytes(l, 2048, 8)), at);
++    try std.testing.expectEqual(@as(usize, 16384 / 16 + 384), maxItems(l, 2048, 8));
++    try std.testing.expect(at + 256 + maxItems(l, 2048, 8) * 12 <= bytes);
++    // the kernels' column blocks: the rows kernel 128 columns, the wide one 64, of a rank's 1152 and the 4608 width
++    try std.testing.expect(1152 % 128 == 0 and 4608 % 128 == 0);
++}
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 807ac2f..149fa47 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -14,7 +14,7 @@ const Buf = cuda.DeviceBuffer;
+ /// The kernels a forward launches: main's dense and grouped EXL3, the family's attention and glue.
+ pub const Modules = struct {
+     dense: cuda.exl3.Dense,
+-    experts: cuda.exl3_experts.Experts,
++    experts: experts.Kernels,
+     attn: kernels.Kernels,
+     ops: ops.Kernels,
+     side: Side,
+@@ -23,7 +23,7 @@ pub const Modules = struct {
+     pub fn load(d: *const cuda.Driver) !Modules {
+         var dense = try cuda.exl3.Dense.load(d);
+         errdefer dense.unload();
+-        var ex = try cuda.exl3_experts.Experts.load(d);
++        var ex = try experts.Kernels.load(d);
+         errdefer ex.unload();
+         var attn = try kernels.Kernels.load(d);
+         errdefer attn.unload();
+@@ -267,7 +267,7 @@ pub const Buffers = struct {
+         b.moe = try A(&b, d, n * h * 4);
+         if (w.share.world > 1) b.gathered = try A(&b, d, w.share.world * n * h * 4);
+         const el = w.layers[0].experts;
+-        b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try cuda.exl3_experts.scratchBytes(el, @min(n, expert_rows), c.topk)), el, @min(n, expert_rows), c.topk);
++        b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try experts.scratchBytes(el, @min(n, expert_rows), c.topk)), el, @min(n, expert_rows), c.topk);
+         b.logits = try Buf.alloc(d, n * w.share.vocab.len() * 4);
+         if (s.hist) b.hist = try A(&b, d, histAt(c, s.kv, n, c.layers, 0));
+         return b;

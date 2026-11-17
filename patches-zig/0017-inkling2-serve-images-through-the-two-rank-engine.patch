@@ -1,0 +1,880 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 12:32:26 +1100
+Subject: [PATCH 17/45] inkling2: serve images through the two-rank engine
+
+With --vision on both ranks, rank 0 loads the tower from the pack's
+vision.safetensors and encodes each request's pictures before its
+prompt's first pass. The rows reach rank 1 by NCCL broadcast and are
+spliced right after the embedding in prompt passes only.
+
+A picture may take 4096 visual tokens at most, and larger ones are
+refused with a message naming the limit. Image prompts are never kept
+in or resumed from the prompt cache, because every picture shares one
+placeholder id.
+---
+ zig/src/families/inkling2/engine.zig        |  43 ++++-
+ zig/src/families/inkling2/engine_images.zig | 144 ++++++++++++++++
+ zig/src/families/inkling2/engine_main.zig   |  23 ++-
+ zig/src/families/inkling2/follow.zig        |  19 ++-
+ zig/src/families/inkling2/forward.zig       |   6 +
+ zig/src/families/inkling2/inkling2.zig      |   2 +
+ zig/src/families/inkling2/lanes.zig         |  19 ++-
+ zig/src/families/inkling2/native.zig        |  25 ++-
+ zig/src/families/inkling2/pictures.zig      | 172 ++++++++++++++++++++
+ zig/src/families/inkling2/vision.zig        |  18 +-
+ 10 files changed, 449 insertions(+), 22 deletions(-)
+ create mode 100644 zig/src/families/inkling2/engine_images.zig
+ create mode 100644 zig/src/families/inkling2/pictures.zig
+
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index be47b3c..1099291 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -10,6 +10,9 @@ const sampler = @import("sampler.zig");
+ const kept = @import("kept.zig");
+ const ds = @import("dspark.zig");
+ const drun = @import("dspark_run.zig");
++const vision = @import("vision.zig");
++const image = @import("image.zig");
++const pictures = @import("pictures.zig");
+ 
+ /// Rows a prompt chunk holds (the prompt cache's mark grid) and a stream's window at most.
+ pub const prompt_rows = 2048;
+@@ -34,7 +37,7 @@ const Seq = struct {
+     ids: [window_rows]i32 = undefined,
+ };
+ 
+-pub const Options = struct { capacity: usize, drafts: bool = true };
++pub const Options = struct { capacity: usize, drafts: bool = true, vision: ?pictures.Limits = null };
+ 
+ /// A stream's draft request: its slot, the rows of its last window it kept (0: the prompt's), the token after them.
+ pub const Req = struct { slot: u32, n: u32, anchor: u32, out: []u32 };
+@@ -73,6 +76,9 @@ pub const Engine = struct {
+     dslots: []drun.Slot = &.{},
+     tap_at: [7]u32 = undefined,
+     tap_bufs: [2]?cuda.DeviceBuffer = .{ null, null },
++    vision: ?pictures.Limits = null, // images on (--vision): every rank's rows a slot, rank 0's tower
++    tower: ?*vision.Tower = null,
++    rows: []pictures.Rows = &.{},
+ 
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, rank: usize, world: usize, o: Options) !*Engine {
+         const e = try gpa.create(Engine);
+@@ -100,6 +106,9 @@ pub const Engine = struct {
+         try e.m.dense.reserve(stream, e.w.head); // scratch grown now, so nothing allocates inside a graph capture
+         if (o.drafts and ds.present(io, gpa, dir)) try e.loadDrafter(dir, o.capacity);
+         errdefer e.freeDrafter();
++        e.vision = o.vision;
++        if (o.vision != null and rank == 0) e.tower = try vision.Tower.load(gpa, io, d, dir, pictures.picture_tokens);
++        errdefer if (e.tower) |t| t.deinit();
+         e.picks = try cuda.DeviceBuffer.alloc(d, world * shared_rows * 8);
+         errdefer e.picks.free();
+         e.picks_host = try gpa.alloc(u8, world * shared_rows * 8);
+@@ -119,6 +128,8 @@ pub const Engine = struct {
+         e.graphs.deinit();
+         e.states.deinit();
+         e.freeDrafter();
++        if (e.tower) |t| t.deinit();
++        pictures.freeRows(e.gpa, e.rows);
+         if (e.st) |*s| s.deinit();
+         if (e.backup) |*b| b.free();
+         e.gpa.free(e.seqs);
+@@ -140,7 +151,8 @@ pub const Engine = struct {
+     /// Bytes one more stream takes on this rank: its slot's rings and conv states, their backup, its drafter caches.
+     pub fn seqBytes(e: *const Engine) u64 {
+         const draft: u64 = if (e.drafter) |dr| drun.slotBytes(&dr.w.c, e.shape_d.kv, e.capacity, e.c.hidden) else 0;
+-        return fw.slotBytes(&e.c, e.shape_d) + e.convBytes() + draft;
++        const rows: u64 = if (e.vision) |l| pictures.slotBytes(l) else 0;
++        return fw.slotBytes(&e.c, e.shape_d) + e.convBytes() + draft + rows;
+     }
+ 
+     /// The drafter's weights, scratch and the forwards' tap rows (rows x 8 taps x hidden, bf16).
+@@ -184,6 +196,7 @@ pub const Engine = struct {
+         }
+         e.backup = try cuda.DeviceBuffer.alloc(e.d, slots * e.convBytes());
+         errdefer e.backup.?.free();
++        if (e.vision) |l| e.rows = try pictures.makeRows(e.gpa, e.d, l, slots);
+         e.seqs = try e.gpa.alloc(Seq, slots);
+         @memset(e.seqs, .{});
+         if (e.drafter) |dr| {
+@@ -214,10 +227,30 @@ pub const Engine = struct {
+     /// A new request on the bound slot with `sampling` (null or temperature 0: greedy).
+     pub fn begin(e: *Engine, s: ?sampler.Sampling) void {
+         e.seqs[e.slot] = .{ .sampling = sampler.check(s) };
++        if (e.rows.len > 0) e.rows[e.slot].spans.clearRetainingCapacity(); // a new request splices nothing until told
++    }
++
++    /// The bound slot's pictures for its next prompt pass: rank 0 encodes them (`pics`), every rank gets the rows.
++    pub fn images(e: *Engine, pics: ?[]const image.Prepared, spans: []const vision.Span) !void {
++        const l = e.vision orelse return error.NoVision;
++        if (e.rows.len == 0) return error.Inkling2Reserved;
++        const total = try pictures.checkSpans(spans, l);
++        const r = &e.rows[e.slot];
++        r.spans.clearRetainingCapacity();
++        if (e.tower) |t| {
++            const ps = pics orelse return error.ImagePlaceholders;
++            if (ps.len != spans.len) return error.ImagePlaceholders;
++            for (ps, spans) |p, sp| try t.encode(e.stream, p, r.buf.ptr + @as(u64, sp.row) * vision.hidden * 2);
++        } else if (e.exchange == .local) return error.NoVision;
++        switch (e.exchange) {
++            .local => {},
++            .nccl => |x| try x.lib.check(x.lib.api.ncclBroadcast(r.buf.ptr, r.buf.ptr, @as(usize, total) * vision.hidden * 2, .u8, 0, x.comm, e.stream.handle), "ncclBroadcast"),
++        }
++        try r.spans.appendSlice(e.gpa, spans);
+     }
+ 
+     fn forward(e: *Engine, b: *fw.Buffers, shape: fw.Shape) fw.Forward {
+-        return .{ .d = e.d, .m = &e.m, .w = &e.w, .b = b, .shape = shape, .stream = e.stream, .exchange = e.exchange, .tap_at = if (e.drafter != null) e.tap_at else null };
++        return .{ .d = e.d, .m = &e.m, .w = &e.w, .b = b, .shape = shape, .stream = e.stream, .exchange = e.exchange, .tap_at = if (b.taps != 0) e.tap_at else null };
+     }
+ 
+     /// One chunk of the bound slot's prompt from `start` (0: a fresh pass); the first token once it ends the prompt.
+@@ -236,7 +269,9 @@ pub const Engine = struct {
+         while (at < end) : (at += n) {
+             n = @min(end - at, most);
+             const item = [_]fw.Item{.{ .slot = e.slot, .ids = @ptrCast(ids[at..][0..n]) }};
+-            try f.run(st, &item);
++            var g = f;
++            if (e.rows.len > 0 and e.rows[e.slot].spans.items.len > 0) g.images = .{ .rows = e.rows[e.slot].buf.ptr, .spans = e.rows[e.slot].spans.items, .lo = at };
++            try g.run(st, &item);
+             if (e.drafter) |dr| try dr.absorb(e.stream, &e.dslots[e.slot], e.bp.taps, n, at);
+         }
+         if (end < ids.len) return null;
+diff --git a/zig/src/families/inkling2/engine_images.zig b/zig/src/families/inkling2/engine_images.zig
+new file mode 100644
+index 0000000..aeb8878
+--- /dev/null
++++ b/zig/src/families/inkling2/engine_images.zig
+@@ -0,0 +1,144 @@
++//! tf-inkling2-engine images: image prompts through the serving engine (rank 0 encodes, every rank splices).
++const std = @import("std");
++const cuda = @import("cuda");
++const ink = @import("inkling2");
++const main = @import("engine_main.zig");
++
++const Engine = ink.engine.Engine;
++const dump_slot = 15; // the slot the rows dumps run in (its drafter context is never used)
++
++/// One picture's prompt: its ids (the chat template's, placeholders expanded), the processor's patches, its spans.
++const Prompt = struct { name: []const u8, ids: []u32, pic: ink.image.Prepared, spans: []ink.vision.Span };
++
++/// Each NAME.png + NAME.ids.u32 in `dir`: spliced rows, then greedy solo, drafted and beside a text prompt (1: a miss).
++pub fn run(e: *Engine, a: std.mem.Allocator, io: std.Io, dir: []const u8, out: std.Io.Dir, new: usize, r0: bool) !u8 {
++    var list: std.ArrayList(Prompt) = .empty;
++    var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
++    defer d.close(io);
++    var it = d.iterate();
++    while (try it.next(io)) |ent| {
++        if (!std.mem.endsWith(u8, ent.name, ".png")) continue;
++        const name = try a.dupe(u8, ent.name[0 .. ent.name.len - 4]);
++        const bytes = try d.readFileAlloc(io, ent.name, a, .limited(64 << 20));
++        const raw = try d.readFileAlloc(io, try std.fmt.allocPrint(a, "{s}.ids.u32", .{name}), a, .limited(1 << 20));
++        const ids = try a.alloc(u32, raw.len / 4);
++        @memcpy(std.mem.sliceAsBytes(ids), raw[0 .. ids.len * 4]);
++        const pic = ink.image.prepare(io, a, bytes, ink.pictures.picture_tokens) catch |err| {
++            if (r0) std.debug.print("{s}: refused, {s}: {s}\n", .{ name, @errorName(err), ink.pictures.Offer.explain(err) orelse "" });
++            continue;
++        };
++        const spans = try ink.vision.spans(a, ids);
++        try ink.vision.check(spans, &.{pic});
++        try list.append(a, .{ .name = name, .ids = ids, .pic = pic, .spans = spans });
++    }
++    std.mem.sort(Prompt, list.items, {}, struct {
++        fn lt(_: void, x: Prompt, y: Prompt) bool {
++            return std.mem.lessThan(u8, x.name, y.name);
++        }
++    }.lt);
++    e.graphs.settings.on = false;
++    var bad: usize = 0;
++    const row = @as(usize, e.c.hidden) * 2;
++    for (list.items) |p| {
++        const img: main.Img = .{ .pics = &.{p.pic}, .spans = p.spans };
++        const spliced = try embedRows(e, a, p.ids, img);
++        const tower = try a.alloc(u8, p.pic.tokens() * row);
++        try e.rows[dump_slot].buf.download(0, tower);
++        const plain = try embedRows(e, a, p.ids, null);
++        var k: usize = 0;
++        var same = true;
++        for (p.ids, 0..) |id, i| {
++            const want = if (id == ink.image.image_token) tower[k * row ..][0..row] else plain[i * row ..][0..row];
++            k += @intFromBool(id == ink.image.image_token);
++            same = same and std.mem.eql(u8, spliced[i * row ..][0..row], want);
++        }
++        bad += @intFromBool(!same);
++        if (r0) {
++            try out.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.spliced.bf16", .{p.name}), .data = spliced });
++            try out.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.rows.bf16", .{p.name}), .data = tower });
++            std.debug.print("{s}: {d} rows, {d} image rows; spliced == text rows + tower rows {s}\n", .{ p.name, p.ids.len, k, if (same) "PASS" else "FAIL" });
++        }
++        const solo = try main.greedy(e, a, p.ids, new + 8, img);
++        if (r0) try writeIds(a, io, out, p.name, solo[0..new]);
++        if (e.drafter != null) {
++            const dr = try main.draftedGreedy(e, a, p.ids, new, null, img);
++            const ok = std.mem.eql(u32, solo[0..new], dr.toks[0..new]);
++            bad += @intFromBool(!ok);
++            if (r0) std.debug.print("{s}: drafted == plain {s}; accepted {d}/{d}\n", .{ p.name, if (ok) "PASS" else "FAIL", dr.acc, dr.drafted });
++        }
++        bad += try beside(e, a, p, img, solo[0..new], r0);
++    }
++    if (r0) std.debug.print("images: {d} prompts, {s}\n", .{ list.items.len, if (bad == 0) "PASS" else "FAIL" });
++    return if (bad == 0) 0 else 1;
++}
++
++/// A prompt pass's rows right after the embedding and splice (the forward's layer-0 input), bf16 [rows][hidden].
++fn embedRows(e: *Engine, a: std.mem.Allocator, ids: []const u32, img: ?main.Img) ![]u8 {
++    if (ids.len > ink.engine.prompt_rows) return error.PromptTooLong;
++    try e.bind(dump_slot);
++    e.begin(null);
++    if (img) |im| try e.images(im.pics, im.spans);
++    const taps_n = ink.dspark.taps_n;
++    const h = @as(usize, e.c.hidden);
++    var own: ?cuda.DeviceBuffer = if (e.bp.taps == 0) try cuda.DeviceBuffer.alloc(e.d, ink.engine.prompt_rows * taps_n * h * 2) else null;
++    defer if (own) |*b| b.free();
++    const keep_at = e.tap_at;
++    const keep_taps = e.bp.taps;
++    defer {
++        e.tap_at = keep_at;
++        e.bp.taps = keep_taps;
++    }
++    if (own) |b| e.bp.taps = b.ptr;
++    e.tap_at = .{ 0, std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32) };
++    _ = try e.prefillChunk(ids, 0);
++    try e.stream.synchronize();
++    const all = try a.alloc(u8, ids.len * taps_n * h * 2);
++    try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.bp.taps, .len = all.len, .borrowed = true }).download(0, all);
++    const rows = try a.alloc(u8, ids.len * h * 2);
++    for (0..ids.len) |i| @memcpy(rows[i * h * 2 ..][0 .. h * 2], all[i * taps_n * h * 2 ..][0 .. h * 2]);
++    return rows;
++}
++
++/// The image prompt (slot 1) and a text prompt (its ids without the pictures, slot 2) decoded in shared windows.
++fn beside(e: *Engine, a: std.mem.Allocator, p: Prompt, img: main.Img, solo: []const u32, r0: bool) !usize {
++    var text: std.ArrayList(u32) = .empty;
++    for (p.ids) |id| if (id != ink.image.image_token) try text.append(a, id);
++    const text_solo = try main.greedy(e, a, text.items, solo.len, null);
++    var pend: [2]u32 = undefined;
++    for ([_]u32{ 1, 2 }, 0..) |slot, i| {
++        try e.bind(slot);
++        e.begin(null);
++        if (i == 0) try e.images(img.pics, img.spans);
++        const ids = if (i == 0) p.ids else text.items;
++        var at: usize = 0;
++        pend[i] = while (true) : (at += ink.engine.prompt_rows) {
++            if (try e.prefillChunk(ids, at)) |t| break t;
++        };
++    }
++    var got: [2][]u32 = .{ try a.alloc(u32, solo.len), try a.alloc(u32, solo.len) };
++    for (0..solo.len) |j| {
++        var o: [2][1]u32 = undefined;
++        for (0..2) |i| got[i][j] = pend[i];
++        try e.verifyShared(&.{ .{ .slot = 1, .ids = got[0][j..][0..1], .out = &o[0] }, .{ .slot = 2, .ids = got[1][j..][0..1], .out = &o[1] } });
++        for ([_]u32{ 1, 2 }, 0..) |slot, i| {
++            try e.bind(slot);
++            try e.keep(1);
++            pend[i] = o[i][0];
++        }
++    }
++    const ok = [2]bool{ std.mem.eql(u32, got[0], solo), std.mem.eql(u32, got[1], text_solo) };
++    if (r0) std.debug.print("{s}: concurrent image == solo {s}, text == solo {s}\n", .{ p.name, pf(ok[0]), pf(ok[1]) });
++    return @intFromBool(!ok[0]) + @intFromBool(!ok[1]);
++}
++
++fn pf(ok: bool) []const u8 {
++    return if (ok) "PASS" else "FAIL";
++}
++
++fn writeIds(a: std.mem.Allocator, io: std.Io, out: std.Io.Dir, name: []const u8, toks: []const u32) !void {
++    var json: std.ArrayList(u8) = .empty;
++    try json.appendSlice(a, "[");
++    for (toks, 0..) |t, j| try json.print(a, "{s}{d}", .{ if (j > 0) ", " else "", t });
++    try json.appendSlice(a, "]\n");
++    try out.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.greedy.json", .{name}), .data = json.items });
++}
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index 3aa18f3..80ee60f 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -3,13 +3,16 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const ink = @import("inkling2");
+ 
+-const usage = "usage: tf-inkling2-engine graphs|greedy|drafts <model dir> <ids.json> <out dir> [context] [new tokens]\n" ++
++const usage = "usage: tf-inkling2-engine graphs|greedy|drafts|images <model dir> <ids.json> <out dir> [context] [new tokens]\n" ++
+     "  graphs: decode windows eager in some slots and graphed in others on the same rows; logits must match bit for bit\n" ++
+     "  greedy: each text's prompt pass then greedy decode rows, eager (writes greedy.json: name -> tokens)\n" ++
+     "  drafts: the drafter at ~12 anchors a text after a prompt pass to each (drafts.json, drafts-r<rank>.bin)\n" ++
++    "  images: <ids.json> is a directory of NAME.png + NAME.ids.u32; spliced rows, solo/drafted/concurrent greedy\n" ++
+     "  two ranks: TF_INKLING2_RANK, TF_INKLING2_WORLD and NCCL_COMM_ID on both\n";
+ 
+ const Text = struct { name: []const u8, ids: []u32 };
++/// A prompt's pictures (rank 0 encodes them) and their placeholder spans.
++pub const Img = struct { pics: []const ink.image.Prepared, spans: []const ink.vision.Span };
+ 
+ pub fn main(init: std.process.Init) !u8 {
+     const a = init.arena.allocator();
+@@ -21,7 +24,8 @@ pub fn main(init: std.process.Init) !u8 {
+         return 2;
+     }
+     const graphs = std.mem.eql(u8, args[1], "graphs");
+-    const text = try std.Io.Dir.cwd().readFileAlloc(io, args[3], a, .limited(1 << 26));
++    const pics = std.mem.eql(u8, args[1], "images");
++    const text: []const u8 = if (pics) "{}" else try std.Io.Dir.cwd().readFileAlloc(io, args[3], a, .limited(1 << 26));
+     var doc = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+     defer doc.deinit();
+     var list: std.ArrayList(Text) = .empty;
+@@ -43,7 +47,7 @@ pub fn main(init: std.process.Init) !u8 {
+     const place = try ink.admit.place();
+     var group: ?cuda.tp_group.Group = null;
+     defer if (group) |*g| g.close(); // after the engine (its graphs hold the comm's kernels), as the server closes
+-    const e = try ink.engine.Engine.init(gpa, io, &driver, args[2], place.rank, place.world, .{ .capacity = ink.native.capacity(context) });
++    const e = try ink.engine.Engine.init(gpa, io, &driver, args[2], place.rank, place.world, .{ .capacity = ink.native.capacity(context), .vision = if (pics) .{ .image_tokens = ink.pictures.default_image_tokens, .max_images = 4 } else null });
+     defer e.deinit();
+     if (place.world > 1) {
+         group = try cuda.tp_group.Group.open(&driver, place.rank, place.world);
+@@ -56,14 +60,15 @@ pub fn main(init: std.process.Init) !u8 {
+     defer out.close(io);
+     const r0 = place.rank == 0;
+     if (std.mem.eql(u8, args[1], "drafts")) return drafts(e, a, io, out, list.items, place.rank);
++    if (pics) return @import("engine_images.zig").run(e, a, io, args[3], out, new, r0);
+     if (std.mem.eql(u8, args[1], "drafted")) {
+         var bad: usize = 0;
+         for (list.items) |t| {
+             e.graphs.settings.on = false;
+-            const plain = try greedy(e, a, t.ids, new + 8);
++            const plain = try greedy(e, a, t.ids, new + 8, null);
+             for ([_]u8{ 0, 1, 2 }) |arm| {
+                 e.graphs.settings.on = arm == 1;
+-                const d = try draftedGreedy(e, a, t.ids, new, if (arm == 2) plain else null);
++                const d = try draftedGreedy(e, a, t.ids, new, if (arm == 2) plain else null, null);
+                 const same = std.mem.eql(u32, plain[0..new], d.toks[0..new]);
+                 bad += @intFromBool(!same);
+                 const what = [_][]const u8{ "eager", "graphed", "oracle drafts" };
+@@ -77,7 +82,7 @@ pub fn main(init: std.process.Init) !u8 {
+         var json: std.ArrayList(u8) = .empty;
+         try json.appendSlice(a, "{");
+         for (list.items, 0..) |t, i| {
+-            const toks = try greedy(e, a, t.ids, new);
++            const toks = try greedy(e, a, t.ids, new, null);
+             try json.print(a, "{s}\"{s}\": [", .{ if (i > 0) ", " else "", t.name });
+             for (toks, 0..) |x, j| try json.print(a, "{s}{d}", .{ if (j > 0) ", " else "", x });
+             try json.appendSlice(a, "]");
+@@ -112,9 +117,10 @@ pub fn main(init: std.process.Init) !u8 {
+ }
+ 
+ /// Greedy with a 7-draft block before each 8-row window, agreeing rows kept; `oracle`: plain's tokens, one spoiled.
+-fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize, oracle: ?[]const u32) !struct { toks: []u32, acc: usize, drafted: usize, windows: usize } {
++pub fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize, oracle: ?[]const u32, img: ?Img) !struct { toks: []u32, acc: usize, drafted: usize, windows: usize } {
+     try e.bind(0);
+     e.begin(null);
++    if (img) |im| try e.images(im.pics, im.spans);
+     var at: usize = 0;
+     var tok: u32 = while (true) : (at += ink.engine.prompt_rows) {
+         if (try e.prefillChunk(ids, at)) |t| break t;
+@@ -147,9 +153,10 @@ fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32,
+ }
+ 
+ /// A text's prompt pass on the bound slot then `n` greedy tokens, one decode row at a time.
+-fn greedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize) ![]u32 {
++pub fn greedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize, img: ?Img) ![]u32 {
+     try e.bind(0);
+     e.begin(null);
++    if (img) |im| try e.images(im.pics, im.spans);
+     var at: usize = 0;
+     var tok: u32 = while (true) : (at += ink.engine.prompt_rows) {
+         if (try e.prefillChunk(ids, at)) |t| break t;
+diff --git a/zig/src/families/inkling2/follow.zig b/zig/src/families/inkling2/follow.zig
+index 75c8e7c..867b7a2 100644
+--- a/zig/src/families/inkling2/follow.zig
++++ b/zig/src/families/inkling2/follow.zig
+@@ -5,8 +5,11 @@ const engine = @import("engine.zig");
+ const ops = @import("ops.zig");
+ const sampler = @import("sampler.zig");
+ const Engine = engine.Engine;
++const image = @import("image.zig");
++const vision = @import("vision.zig");
++const pictures = @import("pictures.zig");
+ 
+-pub const Kind = enum(u32) { begin = 1, chunk, shared, keep, release, idle, end, save, drop, reserve, block };
++pub const Kind = enum(u32) { begin = 1, chunk, shared, keep, release, idle, end, save, drop, reserve, block, images };
+ 
+ /// One step as it crosses: 64 bytes, then `n` u32 ids. NCCL waits as long as it takes, so a follower idles safely.
+ pub const Header = extern struct {
+@@ -215,6 +218,14 @@ pub const Leader = struct {
+         try x.e.verifyShared(parts);
+     }
+ 
++    /// The bound slot's pictures on every rank: their spans go out first, then rank 0 encodes and sends the rows.
++    pub fn images(x: *Leader, pics: []const image.Prepared, spans: []const vision.Span) !void {
++        var words: [3 * 64]u32 = undefined;
++        _ = try pictures.checkSpans(spans, x.e.vision orelse return error.NoVision);
++        try x.send(.{ .kind = @backingInt(Kind.images), .depth = @intCast(spans.len) }, try pictures.toWords(spans, &words));
++        try x.e.images(pics, spans);
++    }
++
+     pub fn keep(x: *Leader, n: usize) !void {
+         try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
+         try x.e.keep(n);
+@@ -241,7 +252,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
+         const step = try link.receive();
+         const h = step.h;
+         const kind: Kind = @fromBackingInt(@intCast(h.kind));
+-        if (kind == .begin or kind == .chunk or kind == .keep or kind == .save) try e.bind(h.slot);
++        if (kind == .begin or kind == .chunk or kind == .keep or kind == .save or kind == .images) try e.bind(h.slot);
+         switch (kind) {
+             .reserve => try e.reserve(@intCast(h.a)),
+             .begin => e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
+@@ -271,6 +282,10 @@ pub fn follow(e: *Engine, link: *Link) !void {
+                 try e.verifyShared(parts[0..k]);
+             },
+             .keep => try e.keep(@intCast(h.a)),
++            .images => {
++                var spans: [64]vision.Span = undefined;
++                try e.images(null, try pictures.fromWords(step.ids, &spans));
++            },
+             .block => {
+                 const k = h.depth;
+                 if (k == 0 or k > engine.max_shared or step.ids.len != 4 * k) return error.BadStep;
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 5cffd4e..9076f2d 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -6,6 +6,7 @@ const kernels = @import("kernels.zig");
+ const ops = @import("ops.zig");
+ const experts = @import("experts.zig");
+ const weights = @import("weights.zig");
++const vision = @import("vision.zig");
+ 
+ const Buf = cuda.DeviceBuffer;
+ 
+@@ -264,6 +265,9 @@ fn stageBytes(n: usize, ni: usize, nt: usize) usize {
+     return layout(n, ni, nt).end + 256;
+ }
+ 
++/// A prompt call's image rows (bf16 [tokens][hidden]) and spans; its rows stand at prompt positions lo, lo + 1, ...
++pub const Images = struct { rows: u64, spans: []const vision.Span, lo: usize };
++
+ /// A staged call: its rows, streams, tiles, the latest row's position and the partials' stride.
+ pub const Plan = struct { n: usize, ni: usize, nt: usize, last: usize, stride: u32 };
+ 
+@@ -276,6 +280,7 @@ pub const Forward = struct {
+     stream: cuda.Stream,
+     exchange: Exchange = .local,
+     tap_at: ?[7]u32 = null, // the layers whose input (the partial block) the drafter's first seven taps read
++    images: ?Images = null, // a prompt call's pictures: its one stream's rows from prompt position `lo`
+ 
+     /// The drafter's taps of layer `i`'s input (b.x, the running partial block): copies only, the forward unchanged.
+     fn tap(f: Forward, i: usize, n: usize) !void {
+@@ -386,6 +391,7 @@ pub const Forward = struct {
+         const conv_segs = base + lay.conv;
+         const streams = p.ni;
+         try ops.embed(k, s, base, n, f.w.embed, f.w.embed_norm, b.x, h, c.eps);
++        if (f.images) |im| try vision.splice(f.d, s, im.rows, im.spans, im.lo, im.lo + n, b.x);
+         var nb: usize = 0;
+         const hd: usize = c.head_dim;
+         const kvw = f.shape.kv * hd;
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index dc5bb72..51cae5f 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -2,6 +2,7 @@
+ 
+ pub const image = @import("image.zig");
+ pub const vision = @import("vision.zig");
++pub const pictures = @import("pictures.zig");
+ pub const config = @import("config.zig");
+ pub const chat = @import("chat.zig");
+ pub const admit = @import("admit.zig");
+@@ -28,6 +29,7 @@ pub const model_type = "inkling2";
+ test {
+     _ = image;
+     _ = vision;
++    _ = pictures;
+     _ = config;
+     _ = chat;
+     _ = admit;
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 09432ff..9d779b5 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -3,6 +3,8 @@ const std = @import("std");
+ const lanes = @import("lanes");
+ const engine = @import("engine.zig");
+ const follow = @import("follow.zig");
++const image = @import("image.zig");
++const pictures = @import("pictures.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -18,6 +20,7 @@ const Lane = struct {
+     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
+     held: [max_held]u32 = undefined, // the drafter's block for the next window
+     held_n: usize = 0,
++    pictures: bool = false, // an image prompt: never resumed from or kept in the prompt cache
+ };
+ 
+ /// A DSpark block's drafts at most.
+@@ -125,7 +128,7 @@ pub const Lanes = struct {
+     fn opening(self: *Lanes, s: *lanes.Stream) !?follow.Kept {
+         const ids = s.prompt();
+         if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
+-        if (s.images.len > 0) return error.NoVision;
++        if (s.images.len > 0 and self.x.e.vision == null) return error.NoVision;
+         const gop = try self.lanes.getOrPut(self.x.e.gpa, s);
+         if (!gop.found_existing) gop.value_ptr.* = .{ .slot = try self.pick(s) };
+         const l = gop.value_ptr;
+@@ -133,10 +136,19 @@ pub const Lanes = struct {
+         l.fill = null;
+         l.first = null;
+         l.held_n = 0;
++        l.pictures = s.images.len > 0;
+         errdefer _ = self.lanes.remove(s);
+         try self.x.bind(l.slot);
+         try self.x.begin(s.sampling);
+         s.cached = 0;
++        if (l.pictures) {
++            // every picture shares the placeholder id, so a kept state cannot tell two pictures apart
++            var pics: [64]image.Prepared = undefined;
++            const spans = try pictures.fromRequest(self.x.e.gpa, ids, s.images, &pics);
++            defer self.x.e.gpa.free(spans);
++            try self.x.images(pics[0..s.images.len], spans);
++            return null;
++        }
+         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len, l.slot);
+     }
+ 
+@@ -167,8 +179,9 @@ pub const Lanes = struct {
+         const from = try self.opening(s);
+         var at: usize = if (from) |r| r.at else 0;
+         var resume_id: ?u64 = if (from) |r| r.id else null;
++        const keeps = !self.lanes.getPtr(s).?.pictures;
+         while (true) : (at += engine.prompt_rows) {
+-            if (resume_id == null) mark(s, at);
++            if (resume_id == null and keeps) mark(s, at);
+             if (try self.x.chunk(s.prompt(), at, resume_id, .{ .ptr = s, .check = cancelled })) |first| {
+                 self.lanes.getPtr(s).?.first = self.take(first);
+                 return;
+@@ -186,7 +199,7 @@ pub const Lanes = struct {
+         if (going != null) try self.x.bind(l.slot);
+         const at = going orelse if (from) |r| r.at else 0;
+         errdefer l.fill = null;
+-        if (from == null) mark(s, at);
++        if (from == null and !l.pictures) mark(s, at);
+         if (try self.x.chunk(s.prompt(), at, if (from) |r| r.id else null, .{ .ptr = s, .check = cancelled })) |first| {
+             l.first = self.take(first);
+             l.fill = null;
+diff --git a/zig/src/families/inkling2/native.zig b/zig/src/families/inkling2/native.zig
+index e180282..1eac355 100644
+--- a/zig/src/families/inkling2/native.zig
++++ b/zig/src/families/inkling2/native.zig
+@@ -10,6 +10,8 @@ const engine = @import("engine.zig");
+ const follow = @import("follow.zig");
+ const ink_lanes = @import("lanes.zig");
+ const dspark = @import("dspark.zig");
++const pictures = @import("pictures.zig");
++const tower = @import("vision.zig");
+ 
+ pub const model_type = "inkling2";
+ pub const formats: []const []const u8 = &.{"exl3"};
+@@ -30,7 +32,10 @@ pub const Options = struct {
+     segments: usize = 1,
+     slide: bool = false,
+     room: ?Room = null,
++    vision: ?pictures.Limits = null, // --vision on every rank: rank 0's tower, every rank's image rows
+ };
++/// A request's visual tokens in all unless --vision-image-tokens says otherwise.
++pub const default_image_tokens: u32 = pictures.default_image_tokens;
+ /// The smallest room among the other ranks and whose it is.
+ pub const Peer = struct { bytes: u64, rank: usize };
+ 
+@@ -45,9 +50,16 @@ pub const Loaded = struct {
+     reserve: *const fn (*anyopaque, u32) anyerror!void,
+     peer_room: ?Peer = null,
+     target: *anyopaque, // the prompt cache keeps this rank group's states (snap_*)
++    vision: ?*pictures.Offer = null, // the server's image offer (rank 0's processor and limits)
+ };
+ 
+-/// The text shards' bytes (the drafter's mtp.safetensors and the vision tower are not loaded yet).
++/// The tower's bytes on this rank: rank 0 holds it, its tensors plus scratch for a picture at the cap.
++pub fn visionBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
++    const p = admission.place() catch return 0;
++    return if (p.rank == 0) tower.Tower.bytesFor(a, io, dir, pictures.picture_tokens) else 0;
++}
++
++/// The text shards' bytes (the drafter's mtp.safetensors and vision.safetensors are counted beside them).
+ pub fn tensorWeightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, vision: bool) !u64 {
+     _ = vision;
+     const files = try core.checkpoint.shardFiles(a, io, dir);
+@@ -88,6 +100,7 @@ const Owned = struct {
+     e: *engine.Engine,
+     link: ?follow.Link = null,
+     lanes: ink_lanes.Lanes,
++    offer: ?*pictures.Offer = null,
+ };
+ 
+ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+@@ -121,7 +134,8 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     own.comm = comm;
+     errdefer _ = own.lib.?.api.ncclCommDestroy(own.comm);
+     const cap = capacity(o.context);
+-    own.e = try engine.Engine.init(gpa, io, ctx.d, dir, p.rank, p.world, .{ .capacity = cap, .drafts = o.drafts });
++    const lim: ?pictures.Limits = if (o.vision) |v| .{ .image_tokens = v.image_tokens, .max_images = @min(v.max_images, 64) } else null;
++    own.e = try engine.Engine.init(gpa, io, ctx.d, dir, p.rank, p.world, .{ .capacity = cap, .drafts = o.drafts, .vision = lim });
+     errdefer own.e.deinit();
+     own.link = try follow.Link.init(gpa, ctx.d, &own.lib.?, own.comm, own.e.stream, @max(cap, engine.prompt_rows));
+     errdefer own.link.?.deinit();
+@@ -159,6 +173,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     }
+     own.link.?.asleep = cuda.tp_watch.open();
+     own.lanes = .{ .x = .{ .e = own.e, .link = &own.link.? } };
++    if (lim) |l| own.offer = try pictures.Offer.init(gpa, io, l);
+     return .{
+         .backend = own.lanes.backend(),
+         .facts = own.lanes.facts(),
+@@ -169,6 +184,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         .reserve = reserveFn,
+         .peer_room = peer,
+         .target = own,
++        .vision = own.offer,
+     };
+ }
+ 
+@@ -220,6 +236,7 @@ fn close(ptr: *anyopaque) void {
+ }
+ 
+ fn release(own: *Owned) void {
++    if (own.offer) |v| v.deinit();
+     if (own.link) |*l| l.deinit();
+     own.e.deinit();
+     if (own.group) |*g| if (g.fast) |f| f.deinit();
+@@ -235,7 +252,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+     return admission.explain(err) orelse switch (err) {
+         error.NoCommId => "Inkling 2's ranks meet over NCCL: set NCCL_COMM_ID to rank 0's address:port on both hosts",
+         error.UnexpectedInkling2Tensor => "a tensor is not stored as the Inkling 2 EXL3 pack stores it (the log names it)",
+-        error.NoVision => "images are not served by the Inkling 2 CUDA family yet",
++        error.NoVision => "images need --vision on both ranks (rank 0 runs the tower from the pack's vision.safetensors)",
++        error.ImagePlaceholders => "the prompt's image placeholders do not match its pictures",
++        error.ImageTooLarge => pictures.Offer.explain(error.ImageTooLarge).?,
+         else => null,
+     };
+ }
+diff --git a/zig/src/families/inkling2/pictures.zig b/zig/src/families/inkling2/pictures.zig
+new file mode 100644
+index 0000000..a36efb1
+--- /dev/null
++++ b/zig/src/families/inkling2/pictures.zig
+@@ -0,0 +1,172 @@
++//! Served pictures: the server's image offer, each slot's image rows and spans, the rows' trip to every rank.
++const std = @import("std");
++const cuda = @import("cuda");
++const core = @import("core");
++const image = @import("image.zig");
++const vision = @import("vision.zig");
++
++/// Visual tokens one picture may take: 2560 x 2560 pixels (the processor never resizes, so larger ones are refused).
++pub const picture_tokens: u32 = 4096;
++/// A request's visual tokens in all unless --vision-image-tokens says otherwise (one picture at the cap).
++pub const default_image_tokens: u32 = 4096;
++/// The chat template's tokens around an image: `<|content_image|>`, the placeholder, `<|end_message|>`.
++pub const content_image: u32 = 200005;
++pub const end_message: u32 = 200010;
++
++/// A request's image limits (--vision): visual tokens in all and pictures.
++pub const Limits = struct { image_tokens: u32, max_images: u32 };
++
++/// What rank 0 offers the server: the processor, the template's tokens, the limits.
++pub const Offer = struct {
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    limits: Limits,
++    marks: struct { image: u32, open: u32, close: u32 } = .{ .image = image.image_token, .open = content_image, .close = end_message },
++    mark_ids: [3]u32 = .{ content_image, image.image_token, end_message },
++
++    /// The template writes `<|content_image|>` and `<|end_message|>` itself: the server expands the placeholder alone.
++    pub const template_wraps = true;
++
++    pub fn init(gpa: std.mem.Allocator, io: std.Io, limits: Limits) !*Offer {
++        const v = try gpa.create(Offer);
++        v.* = .{ .gpa = gpa, .io = io, .limits = limits };
++        return v;
++    }
++
++    pub fn deinit(v: *Offer) void {
++        v.gpa.destroy(v);
++    }
++
++    /// The server's processor (on the HTTP thread): one token per 40 x 40 cell, refused past the cap or the budget.
++    pub fn prepare(v: *const Offer, a: std.mem.Allocator, bytes: []const u8, max: u32) !Prepared {
++        const cap = @min(max, picture_tokens);
++        if (cap == 0) return error.ImageTooSmall;
++        const p = try image.prepare(v.io, a, bytes, cap);
++        const g = [2]u32{ p.rows, p.cols };
++        return .{ .pixels = p.pixels, .gh = p.rows, .gw = p.cols, .tokens = p.tokens(), .hash = core.picture.identity.withGrid(core.picture.identity.ofBytes(0x1a2b, bytes), g) };
++    }
++
++    pub fn explain(err: anyerror) ?[]const u8 {
++        return switch (err) {
++            error.ImageTooLarge => "too large: Inkling 2 reads one visual token per 40 x 40 pixels with no resize, at most 4096 a " ++
++                "picture (2560 x 2560) and the request's --vision-image-tokens shared by its pictures; send it smaller",
++            else => image.explain(err),
++        };
++    }
++};
++
++/// prepare's answer, in the fields the server's offer reads.
++pub const Prepared = struct { pixels: []f32, gh: u32, gw: u32, tokens: u32, hash: u64 };
++
++/// One slot's pictures for its prompt pass: their rows (bf16 [tokens][hidden]) and where they go.
++pub const Rows = struct {
++    buf: cuda.DeviceBuffer,
++    spans: std.ArrayList(vision.Span) = .empty,
++};
++
++/// Bytes a slot's image rows take at a request's limit.
++pub fn slotBytes(l: Limits) u64 {
++    return @as(u64, l.image_tokens) * vision.hidden * 2;
++}
++
++/// Every slot's rows buffer, made with the slots.
++pub fn makeRows(gpa: std.mem.Allocator, d: *const cuda.Driver, l: Limits, slots: usize) ![]Rows {
++    const rows = try gpa.alloc(Rows, slots);
++    var made: usize = 0;
++    errdefer {
++        for (rows[0..made]) |*r| r.buf.free();
++        gpa.free(rows);
++    }
++    for (rows) |*r| {
++        r.* = .{ .buf = try cuda.DeviceBuffer.alloc(d, slotBytes(l)) };
++        made += 1;
++    }
++    return rows;
++}
++
++pub fn freeRows(gpa: std.mem.Allocator, rows: []Rows) void {
++    for (rows) |*r| {
++        r.buf.free();
++        r.spans.deinit(gpa);
++    }
++    gpa.free(rows);
++}
++
++/// The request's pictures as the tower reads them, and their spans: each at its first placeholder, rows in order.
++pub fn fromRequest(a: std.mem.Allocator, ids: []const u32, imgs: anytype, pics: []image.Prepared) ![]vision.Span {
++    if (imgs.len > pics.len) return error.ImageCount;
++    const list = try vision.spans(a, ids);
++    errdefer a.free(list);
++    if (list.len != imgs.len) return error.ImagePlaceholders;
++    for (imgs, pics[0..imgs.len], list) |im, *p, sp| {
++        if (im.at != sp.at or im.tokens != sp.n or im.tokens != im.gh * im.gw) return error.ImagePlaceholders;
++        p.* = .{ .pixels = @constCast(im.pixels), .rows = im.gh, .cols = im.gw };
++    }
++    try vision.check(list, pics[0..imgs.len]);
++    return list;
++}
++
++/// Spans checked against a slot's rows (a follower's step, or rank 0's before it goes out): rows in order, in room.
++pub fn checkSpans(list: []const vision.Span, l: Limits) !u32 {
++    var row: u32 = 0;
++    var end: u32 = 0;
++    for (list) |sp| {
++        if (sp.n == 0 or sp.row != row or sp.at < end) return error.ImagePlaceholders;
++        row += sp.n;
++        end = sp.at + sp.n;
++    }
++    if (row > l.image_tokens or list.len > l.max_images) return error.ImageTooLarge;
++    return row;
++}
++
++/// Spans as a step's words (at, n, row each) and back.
++pub fn toWords(list: []const vision.Span, out: []u32) ![]u32 {
++    if (out.len < 3 * list.len) return error.TooManyImages;
++    for (list, 0..) |sp, i| out[3 * i ..][0..3].* = .{ sp.at, sp.n, sp.row };
++    return out[0 .. 3 * list.len];
++}
++
++pub fn fromWords(words: []const u32, out: []vision.Span) ![]vision.Span {
++    if (words.len % 3 != 0 or words.len / 3 > out.len) return error.BadStep;
++    for (out[0 .. words.len / 3], 0..) |*sp, i| sp.* = .{ .at = words[3 * i], .n = words[3 * i + 1], .row = words[3 * i + 2] };
++    return out[0 .. words.len / 3];
++}
++
++test "spans cross as words and back; a slot's spans are checked against its limits" {
++    const list = [_]vision.Span{ .{ .at = 3, .n = 15, .row = 0 }, .{ .at = 40, .n = 4, .row = 15 } };
++    var w: [6]u32 = undefined;
++    var back: [4]vision.Span = undefined;
++    const got = try fromWords(try toWords(&list, &w), &back);
++    try std.testing.expectEqualSlices(vision.Span, &list, got);
++    try std.testing.expectEqual(@as(u32, 19), try checkSpans(&list, .{ .image_tokens = 19, .max_images = 2 }));
++    try std.testing.expectError(error.ImageTooLarge, checkSpans(&list, .{ .image_tokens = 18, .max_images = 2 }));
++    try std.testing.expectError(error.ImageTooLarge, checkSpans(&list, .{ .image_tokens = 64, .max_images = 1 }));
++    const gap = [_]vision.Span{.{ .at = 3, .n = 15, .row = 1 }};
++    try std.testing.expectError(error.ImagePlaceholders, checkSpans(&gap, .{ .image_tokens = 64, .max_images = 2 }));
++    try std.testing.expectError(error.BadStep, fromWords(w[0..5], &back));
++}
++
++test "a request's pictures map to their placeholder runs; a count or place that differs is refused" {
++    const a = std.testing.allocator;
++    const t = image.image_token;
++    const Img = struct { pixels: []const f32, gh: u32, gw: u32, at: u32, tokens: u32 };
++    var px: [6 * image.side * image.side * 3]f32 = undefined;
++    const ids = [_]u32{ 9, content_image, t, t, t, t, end_message, 5, content_image, t, t, end_message };
++    var pics: [4]image.Prepared = undefined;
++    const two = [_]Img{ .{ .pixels = px[0..], .gh = 2, .gw = 2, .at = 2, .tokens = 4 }, .{ .pixels = px[0..], .gh = 1, .gw = 2, .at = 9, .tokens = 2 } };
++    const got = try fromRequest(a, &ids, &two, &pics);
++    defer a.free(got);
++    try std.testing.expectEqual(vision.Span{ .at = 9, .n = 2, .row = 4 }, got[1]);
++    try std.testing.expectEqual(@as(u32, 2), pics[1].cols);
++    const moved = [_]Img{ two[0], .{ .pixels = px[0..], .gh = 1, .gw = 2, .at = 8, .tokens = 2 } };
++    try std.testing.expectError(error.ImagePlaceholders, fromRequest(a, &ids, &moved, &pics));
++    try std.testing.expectError(error.ImagePlaceholders, fromRequest(a, &ids, two[0..1], &pics));
++}
++
++test "the cap: a picture past 4096 tokens is refused with words naming the limit; the slot rows fit the default" {
++    try std.testing.expect(image.tokensFor(2560, 2560) == picture_tokens);
++    try std.testing.expect(image.tokensFor(2561, 2560) > picture_tokens);
++    try std.testing.expect(std.mem.indexOf(u8, Offer.explain(error.ImageTooLarge).?, "4096") != null);
++    try std.testing.expectEqual(@as(u64, 4096 * 4608 * 2), slotBytes(.{ .image_tokens = default_image_tokens, .max_images = 4 }));
++    try std.testing.expect(vision.scratchBytes(picture_tokens) < 1 << 30);
++}
+diff --git a/zig/src/families/inkling2/vision.zig b/zig/src/families/inkling2/vision.zig
+index 4c95b5f..eced25b 100644
+--- a/zig/src/families/inkling2/vision.zig
++++ b/zig/src/families/inkling2/vision.zig
+@@ -51,6 +51,20 @@ pub const Kernels = struct {
+     }
+ };
+ 
++/// The tower's tensors: a pack's vision.safetensors sidecar (as the release stores them), else the model's shards.
++fn openTower(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !core.Checkpoint {
++    var buf: [std.fs.max_path_bytes]u8 = undefined;
++    const path = try std.fmt.bufPrint(&buf, "{s}/" ++ sidecar, .{dir});
++    std.Io.Dir.cwd().access(io, path, .{}) catch return core.Checkpoint.openModelPrefixes(gpa, io, dir, &prefixes);
++    var ck: core.Checkpoint = .{ .gpa = gpa, .io = io };
++    errdefer ck.close();
++    try ck.add(dir, sidecar);
++    return ck;
++}
++
++/// The file a pack carries the tower in, copied unchanged from the release's shards.
++pub const sidecar = "vision.safetensors";
++
+ fn go(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, shared: u32, a: *cuda.Args) !void {
+     try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = threads }, .shared = shared }, s, a);
+ }
+@@ -134,7 +148,7 @@ pub const Tower = struct {
+             t.bufs.deinit(gpa);
+             t.g.deinit();
+         }
+-        var ck = try core.Checkpoint.openModelPrefixes(gpa, io, dir, &prefixes);
++        var ck = try openTower(gpa, io, dir);
+         defer core.checkpoint.cache.close(&ck);
+         t.patch_w = try t.get(&ck, pre ++ "embeddings.patch_embedding.weight", &.{ width, image.patch_width });
+         t.table = try t.get(&ck, pre ++ "embeddings.position_embedding", &.{ image.grid * image.grid, width });
+@@ -193,7 +207,7 @@ pub const Tower = struct {
+ 
+     /// The device bytes load takes for `dir`: the tower's tensors as stored, scratch and workspace for `max_tokens`.
+     pub fn bytesFor(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, max_tokens: u32) !u64 {
+-        var ck = try core.Checkpoint.openModelPrefixes(gpa, io, dir, &prefixes);
++        var ck = try openTower(gpa, io, dir);
+         defer core.checkpoint.cache.close(&ck);
+         var total: u64 = scratchBytes(max_tokens);
+         for (ck.files.items) |*f| for (f.names.keys()) |name| {

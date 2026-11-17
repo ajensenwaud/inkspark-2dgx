@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 11:44:10 +1100
+Subject: [PATCH 14/45] inkling2: one-line comment for the drafted check
+
+---
+ zig/src/families/inkling2/engine_main.zig | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index ba54840..cece4a1 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -111,8 +111,7 @@ pub fn main(init: std.process.Init) !u8 {
+     return if (pass == total) 0 else 1;
+ }
+ 
+-/// Greedy decode with a 7-draft block before every window: one 8-row window, the agreeing rows kept (fixed depth).
+-/// With `oracle` (plain greedy's tokens) the drafts are its next tokens, one of them spoiled per window in turn.
++/// Greedy with a 7-draft block before each 8-row window, agreeing rows kept; `oracle`: plain's tokens, one spoiled.
+ fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize, oracle: ?[]const u32) !struct { toks: []u32, acc: usize, drafted: usize, windows: usize } {
+     try e.bind(0);
+     e.begin(null);

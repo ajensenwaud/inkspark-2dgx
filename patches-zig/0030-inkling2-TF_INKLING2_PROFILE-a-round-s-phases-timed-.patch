@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 06:36:12 +1100
+Subject: [PATCH 30/45] inkling2: TF_INKLING2_PROFILE, a round's phases timed
+ on each rank
+
+Rank 0 times the lanes calls, the forward apart from the draws (a sync
+when on), the steps it sends and the time outside every call; the other
+ranks time waiting for a step against running it. A line every 200
+rounds; off by default and then free.
+---
+ zig/src/families/inkling2/engine.zig   |  7 +++
+ zig/src/families/inkling2/follow.zig   |  8 +++
+ zig/src/families/inkling2/inkling2.zig |  1 +
+ zig/src/families/inkling2/lanes.zig    | 12 ++++
+ zig/src/families/inkling2/profile.zig  | 86 ++++++++++++++++++++++++++
+ 5 files changed, 114 insertions(+)
+ create mode 100644 zig/src/families/inkling2/profile.zig
+
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 4e08db0..5068d63 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -13,6 +13,7 @@ const drun = @import("dspark_run.zig");
+ const vision = @import("vision.zig");
+ const image = @import("image.zig");
+ const pictures = @import("pictures.zig");
++const prof = @import("profile.zig");
+ 
+ /// Rows a prompt chunk holds (the prompt cache's mark grid) and a stream's window at most.
+ pub const prompt_rows = 2048;
+@@ -88,6 +89,7 @@ pub const Engine = struct {
+         const e = try gpa.create(Engine);
+         errdefer gpa.destroy(e);
+         const c = try cfg.Config.read(gpa, io, dir);
++        try prof.start(io, rank);
+         var stream = try cuda.Stream.init(d, false);
+         errdefer stream.deinit();
+         var m = try fw.Modules.load(d);
+@@ -314,6 +316,7 @@ pub const Engine = struct {
+             if (p.ids.len > 1) try e.convCopy(p.slot, true);
+             rows += p.ids.len;
+         }
++        const p0 = if (prof.global.on) prof.global.now() else 0;
+         const f = e.forward(&e.bd, e.shape_d);
+         const plan = try f.stage(st, items[0..parts.len]);
+         const Body = struct {
+@@ -329,6 +332,9 @@ pub const Engine = struct {
+         const key: Key = .{ .n = @intCast(plan.n), .ni = @intCast(plan.ni), .nt = @intCast(plan.nt), .stride = plan.stride };
+         const print = cuda.graph_cache.fingerprintOf(&.{ st.kc[0], e.bd.ids.ptr, e.bd.parts.o });
+         _ = try e.graphs.run(key, e.stream, print, .{ .ctx = &body, .run = Body.run });
++        if (prof.global.on) try e.stream.synchronize(); // profiling only: the forward timed apart from the draws
++        prof.global.add(.forward, p0);
++        const p1 = if (prof.global.on) prof.global.now() else 0;
+         e.calls += 1;
+         fw.Forward.advance(st, items[0..parts.len]);
+         var row: usize = 0;
+@@ -341,6 +347,7 @@ pub const Engine = struct {
+             try e.draw(&e.bd, row, p.ids.len, st.pos[p.slot] - p.ids.len + 1, e.seqs[p.slot].sampling, p.out[0..p.ids.len]);
+             row += p.ids.len;
+         }
++        prof.global.add(.draws, p1);
+     }
+ 
+     /// The bound slot's last window keeps its first `n` rows: past them its conv states and length go back.
+diff --git a/zig/src/families/inkling2/follow.zig b/zig/src/families/inkling2/follow.zig
+index 867b7a2..8d9c4de 100644
+--- a/zig/src/families/inkling2/follow.zig
++++ b/zig/src/families/inkling2/follow.zig
+@@ -8,6 +8,7 @@ const Engine = engine.Engine;
+ const image = @import("image.zig");
+ const vision = @import("vision.zig");
+ const pictures = @import("pictures.zig");
++const prof = @import("profile.zig");
+ 
+ pub const Kind = enum(u32) { begin = 1, chunk, shared, keep, release, idle, end, save, drop, reserve, block, images };
+ 
+@@ -114,7 +115,9 @@ pub const Leader = struct {
+             cuda.tp_watch.wake();
+             l.asleep = false;
+         }
++        const t0 = if (prof.global.on) prof.global.now() else 0;
+         try l.send(&x.e.m.ops, hh, ids);
++        prof.global.add(.send, t0);
+     }
+ 
+     /// States rank 0 dropped since the last step, so the other ranks free theirs too.
+@@ -249,7 +252,11 @@ pub const Leader = struct {
+ pub fn follow(e: *Engine, link: *Link) !void {
+     cuda.tp_watch.sleep(e.io);
+     while (true) {
++        const t0 = if (prof.global.on) prof.global.now() else 0;
+         const step = try link.receive();
++        prof.global.add(.wait, t0);
++        const t1 = if (prof.global.on) prof.global.now() else 0;
++        defer prof.global.add(.run, t1);
+         const h = step.h;
+         const kind: Kind = @fromBackingInt(@intCast(h.kind));
+         if (kind == .begin or kind == .chunk or kind == .keep or kind == .save or kind == .images) try e.bind(h.slot);
+@@ -280,6 +287,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
+                     row += n;
+                 }
+                 try e.verifyShared(parts[0..k]);
++                if (prof.global.on) prof.global.round(k, row);
+             },
+             .keep => try e.keep(@intCast(h.a)),
+             .images => {
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index 51cae5f..0bda2ce 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -49,4 +49,5 @@ test {
+     _ = dspark;
+     _ = dspark_ops;
+     _ = dspark_run;
++    _ = @import("profile.zig");
+ }
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index ff484e4..acd9b6f 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -5,6 +5,7 @@ const engine = @import("engine.zig");
+ const follow = @import("follow.zig");
+ const image = @import("image.zig");
+ const pictures = @import("pictures.zig");
++const prof = @import("profile.zig");
+ 
+ const be = lanes.backend;
+ 
+@@ -256,6 +257,8 @@ pub const Lanes = struct {
+     /// A round's windows in one forward (Engine.verifyShared), one window or several.
+     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
+         const self = of(ptr);
++        const t0 = if (prof.global.on) prof.global.enter() else 0;
++        defer if (prof.global.on) prof.global.leave(.verify, t0);
+         if (windows.len > engine.max_shared) return error.WindowTooWide;
+         var parts: [engine.max_shared]engine.Part = undefined;
+         var ids: [engine.max_shared][max_rows]u32 = undefined;
+@@ -278,6 +281,11 @@ pub const Lanes = struct {
+         }
+         try self.x.verifyShared(parts[0..windows.len]);
+         if (windows.len > 1) self.shared += 1;
++        if (prof.global.on) {
++            var rows: usize = 0;
++            for (parts[0..windows.len]) |p| rows += p.ids.len;
++            prof.global.round(windows.len, rows);
++        }
+         for (out[0..windows.len], parts[0..windows.len], lane[0..windows.len]) |*o, p, l| {
+             const rows = p.ids.len;
+             @memcpy(o.sampled[0..rows], p.out);
+@@ -288,6 +296,8 @@ pub const Lanes = struct {
+ 
+     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+         const self = of(ptr);
++        const t0 = if (prof.global.on) prof.global.enter() else 0;
++        defer if (prof.global.on) prof.global.leave(.keep, t0);
+         for (windows, paths) |w, path| {
+             if (path.len == 0) return error.EmptyPath;
+             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
+@@ -298,6 +308,8 @@ pub const Lanes = struct {
+     /// DSpark: every request's kept rows committed, then one block round for them all (the ranks' block step).
+     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+         const self = of(ptr);
++        const t0 = if (prof.global.on) prof.global.enter() else 0;
++        defer if (prof.global.on) prof.global.leave(.draft, t0);
+         if (self.x.e.drafter == null) return error.NoDraftHead;
+         if (requests.len > engine.max_shared) return error.TooManyStreams;
+         var reqs: [engine.max_shared]engine.Req = undefined;
+diff --git a/zig/src/families/inkling2/profile.zig b/zig/src/families/inkling2/profile.zig
+new file mode 100644
+index 0000000..33b4f65
+--- /dev/null
++++ b/zig/src/families/inkling2/profile.zig
+@@ -0,0 +1,86 @@
++//! TF_INKLING2_PROFILE=1: wall ms of a round's phases on each rank, a line every 200 rounds (off: no syncs, no cost).
++const std = @import("std");
++
++pub const Phase = enum { verify, forward, draws, keep, draft, send, outside, wait, run };
++const n_phases = 9;
++
++pub const Profile = struct {
++    on: bool = false,
++    io: ?std.Io = null,
++    ns: [n_phases]u64 = @splat(0),
++    calls: [n_phases]u64 = @splat(0),
++    rounds: u64 = 0,
++    rows: u64 = 0,
++    streams: u64 = 0,
++    last_end: ?u64 = null, // rank 0: when the last lanes call returned
++    rank: usize = 0,
++
++    pub fn now(p: *const Profile) u64 {
++        return @intCast(std.Io.Clock.awake.now(p.io.?).toNanoseconds());
++    }
++
++    pub fn add(p: *Profile, ph: Phase, t0: u64) void {
++        if (!p.on) return;
++        p.ns[@intFromEnum(ph)] += p.now() - t0;
++        p.calls[@intFromEnum(ph)] += 1;
++    }
++
++    /// A lanes call starts: the time since the last one returned is outside every call.
++    pub fn enter(p: *Profile) u64 {
++        const t = p.now();
++        if (p.last_end) |e| {
++            p.ns[@intFromEnum(Phase.outside)] += t - e;
++            p.calls[@intFromEnum(Phase.outside)] += 1;
++        }
++        return t;
++    }
++
++    pub fn leave(p: *Profile, ph: Phase, t0: u64) void {
++        const t = p.now();
++        p.ns[@intFromEnum(ph)] += t - t0;
++        p.calls[@intFromEnum(ph)] += 1;
++        p.last_end = t;
++    }
++
++    /// A verify of `streams` windows and `rows` rows ended a round; every 200 rounds one line, then from zero.
++    pub fn round(p: *Profile, streams: usize, rows: usize) void {
++        p.rounds += 1;
++        p.streams += streams;
++        p.rows += rows;
++        if (p.rounds < 200) return;
++        p.print();
++    }
++
++    pub fn print(p: *Profile) void {
++        var buf: [768]u8 = undefined;
++        var w: std.Io.Writer = .fixed(&buf);
++        const n: f64 = @floatFromInt(@max(p.rounds, 1));
++        w.print("inkling2 profile rank {d}: {d} rounds, {d:.2} streams, {d:.2} rows a round; ms a round:", .{ p.rank, p.rounds, @as(f64, @floatFromInt(p.streams)) / n, @as(f64, @floatFromInt(p.rows)) / n }) catch {};
++        for (p.ns, p.calls, 0..) |ns, c, i| {
++            if (c == 0) continue;
++            w.print(" {s} {d:.2} ({d:.1}/round)", .{ @tagName(@as(Phase, @enumFromInt(i))), @as(f64, @floatFromInt(ns)) / 1e6 / n, @as(f64, @floatFromInt(c)) / n }) catch {};
++        }
++        std.log.info("{s}", .{w.buffered()});
++        const keep_on = p.on;
++        const keep_io = p.io;
++        const keep_rank = p.rank;
++        p.* = .{ .on = keep_on, .io = keep_io, .rank = keep_rank };
++    }
++};
++
++/// The process's profile (the lanes host, the engine and the follower share it).
++pub var global: Profile = .{};
++
++/// Turns the profile on from TF_INKLING2_PROFILE (read once, at engine start).
++pub fn start(io: std.Io, rank: usize) !void {
++    global.io = io;
++    global.rank = rank;
++    global.on = try @import("sys").environment.read(bool, "TF_INKLING2_PROFILE", false);
++    if (global.on) std.log.info("inkling2 profile: on (rank {d}); forwards synced to time draws apart", .{rank});
++}
++
++test "profile: off adds nothing; a round line resets the counters" {
++    var p: Profile = .{};
++    p.add(.forward, 0);
++    try std.testing.expectEqual(@as(u64, 0), p.calls[@intFromEnum(Phase.forward)]);
++}

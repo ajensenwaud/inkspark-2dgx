@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:58:35 +1100
+Subject: [PATCH 18/45] inkling2: keep a window's first rows without running
+ them again
+
+A window that kept fewer rows than it ran used to put its conv states
+back and run the kept rows through the whole model again, eagerly, so
+every rejected draft cost a second forward on top of the verify. On the
+live serve that is about 1.8 extra forwards a round at four streams.
+
+The decode calls now keep each row's conv input (the value the state
+holds) in bd.hist, and a short keep rebuilds every site's three inputs
+from the window's backup and the kept rows' inputs in one kernel. The
+values are the ones the verify computed, so the state is the one the
+re-run made. If another decode call has run since, keep falls back to
+the old re-run.
+
+Not run on a GPU yet; tf_ink2_conv_rewind has no kernel contract.
+---
+ zig/kernels/cuda/inkling2/ops.cu      | 26 +++++++++++++++++
+ zig/src/families/inkling2/engine.zig  | 41 +++++++++++++++++++++++++--
+ zig/src/families/inkling2/forward.zig | 29 ++++++++++++++++---
+ zig/src/families/inkling2/ops.zig     | 17 ++++++++++-
+ 4 files changed, 105 insertions(+), 8 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index 0a667c7..4c83f7b 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -254,6 +254,7 @@ struct ConvArgs {
+     float* resid;           // fp32 [rows, C] (modes 1 and 2)
+     uint16_t* out;          // bf16 [rows, C] (modes 0 and 2)
+     const int4* segs;       // per stream (blockIdx.y): row0, rows, state slot; null: one stream, all rows
++    float* hist;            // fp32 [rows, C]: each row's input as the state keeps it (null: none)
+     long long part_stride;
+     long long state_stride;  // elements between the streams' states
+     int parts, x_bf16, round_in, heads, C, rows, mode;  // mode 0: out = y; 1: resid = base + bf16(y); 2: resid + bf16(y)
+@@ -272,6 +273,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv(const ConvArgs a)
+         float x = a.x_bf16 ? bf(static_cast<const uint16_t*>(a.x)[at]) : static_cast<const float*>(a.x)[at];
+         for (int r = 1; r < a.parts; ++r) x += static_cast<const float*>(a.x)[at + r * a.part_stride];
+         if (a.round_in) x = bfr(x);
++        if (a.hist) a.hist[at] = x;
+         float y;
+         if (a.dyn) {
+             const float* d = a.dyn + (static_cast<size_t>(t) * a.heads + hd) * kConvTaps;
+@@ -302,6 +304,30 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv(const ConvArgs a)
+     state[2 * C + c] = h2;
+ }
+ 
++// A conv site of every slot: slot 0's state, its C, and byte offsets of its rows in a hist and in a slot's backup.
++struct RewindSite {
++    float* state;
++    long long hist, backup;
++    int C, pad;
++};
++
++// A window keeps its first n rows: each site's state becomes the last 3 of (backup's 3 inputs, rows' inputs from hist).
++extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv_rewind(const RewindSite* __restrict__ sites, const char* backup,
++                                                                      const char* hist, int slot, int row0, int n) {
++    const RewindSite s = sites[blockIdx.y];
++    const int c = blockIdx.x * blockDim.x + threadIdx.x;
++    if (c >= s.C) return;
++    const int C = s.C;
++    const float* b = reinterpret_cast<const float*>(backup + s.backup);
++    const float* x = reinterpret_cast<const float*>(hist + s.hist) + static_cast<size_t>(row0) * C;
++    float* st = s.state + static_cast<size_t>(slot) * 3 * C;
++#pragma unroll
++    for (int k = 0; k < 3; ++k) {
++        const int i = n - 3 + k;
++        st[k * C + c] = i < 0 ? b[(3 + i) * C + c] : x[static_cast<size_t>(i) * C + c];
++    }
++}
++
+ // The final logit softcap in place: x = tanh(x / cap) * cap.
+ extern "C" __global__ void tf_ink2_softcap(float* __restrict__ x, long long n, float cap) {
+     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 1099291..273fb45 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -35,6 +35,8 @@ const Seq = struct {
+     rows: usize = 0, // rows of the last window still uncommitted
+     at: usize = 0, // where that window started
+     ids: [window_rows]i32 = undefined,
++    row0: usize = 0, // its first row in that decode call
++    call: u64 = 0, // the decode call it ran in (its conv inputs stay in bd.hist until the next one)
+ };
+ 
+ pub const Options = struct { capacity: usize, drafts: bool = true, vision: ?pictures.Limits = null };
+@@ -79,6 +81,8 @@ pub const Engine = struct {
+     vision: ?pictures.Limits = null, // images on (--vision): every rank's rows a slot, rank 0's tower
+     tower: ?*vision.Tower = null,
+     rows: []pictures.Rows = &.{},
++    calls: u64 = 0, // decode calls on bd so far
++    sites: ?cuda.DeviceBuffer = null, // every conv site's ops.RewindSite (keep without a forward)
+ 
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, rank: usize, world: usize, o: Options) !*Engine {
+         const e = try gpa.create(Engine);
+@@ -94,7 +98,7 @@ pub const Engine = struct {
+         const heads = e.w.share.heads.len();
+         const kv = e.w.share.kv.len();
+         e.shape_p = .{ .rows = prompt_rows, .context = o.capacity, .heads = heads, .kv = kv };
+-        e.shape_d = .{ .rows = shared_rows, .context = o.capacity, .heads = heads, .kv = kv, .ring_rows = prompt_rows };
++        e.shape_d = .{ .rows = shared_rows, .context = o.capacity, .heads = heads, .kv = kv, .ring_rows = prompt_rows, .hist = true };
+         errdefer for (e.parts.items) |*b| b.free();
+         const slots = @max(prompt_rows * heads * prompt_parts, shared_rows * heads * fw.stride(&e.c, o.capacity - 1));
+         const shared = try fw.partialsFor(d, &e.parts, gpa, slots);
+@@ -132,6 +136,7 @@ pub const Engine = struct {
+         pictures.freeRows(e.gpa, e.rows);
+         if (e.st) |*s| s.deinit();
+         if (e.backup) |*b| b.free();
++        if (e.sites) |*b| b.free();
+         e.gpa.free(e.seqs);
+         e.gpa.free(e.spans);
+         e.smp.deinit();
+@@ -196,6 +201,11 @@ pub const Engine = struct {
+         }
+         e.backup = try cuda.DeviceBuffer.alloc(e.d, slots * e.convBytes());
+         errdefer e.backup.?.free();
++        e.sites = try e.siteTable();
++        errdefer {
++            e.sites.?.free();
++            e.sites = null;
++        }
+         if (e.vision) |l| e.rows = try pictures.makeRows(e.gpa, e.d, l, slots);
+         e.seqs = try e.gpa.alloc(Seq, slots);
+         @memset(e.seqs, .{});
+@@ -297,6 +307,8 @@ pub const Engine = struct {
+             const q = &e.seqs[p.slot];
+             q.rows = p.ids.len;
+             q.at = st.pos[p.slot];
++            q.row0 = rows;
++            q.call = e.calls + 1;
+             @memcpy(q.ids[0..p.ids.len], ids[rows..][0..p.ids.len]);
+             if (p.ids.len > 1) try e.convCopy(p.slot, true);
+             rows += p.ids.len;
+@@ -316,6 +328,7 @@ pub const Engine = struct {
+         const key: Key = .{ .n = @intCast(plan.n), .ni = @intCast(plan.ni), .nt = @intCast(plan.nt), .stride = plan.stride };
+         const print = cuda.graph_cache.fingerprintOf(&.{ st.kc[0], e.bd.ids.ptr, e.bd.parts.o });
+         _ = try e.graphs.run(key, e.stream, print, .{ .ctx = &body, .run = Body.run });
++        e.calls += 1;
+         fw.Forward.advance(st, items[0..parts.len]);
+         var row: usize = 0;
+         for (parts) |p| {
+@@ -334,16 +347,38 @@ pub const Engine = struct {
+         const st = &e.st.?;
+         const q = &e.seqs[e.slot];
+         if (n == 0 or n > q.rows) return error.BadKeep;
+-        if (n < q.rows) {
+-            // the window's conv states ran over every row: restore them and run the kept rows again (same bits)
++        if (n < q.rows and q.call == e.calls and e.sites != null) {
++            // the window's conv states ran over every row: the kept rows' inputs (kept in bd.hist) after the backup's
++            const sites = @as(usize, e.c.layers) * 4;
++            const backup = e.backup.?.ptr + e.slot * e.convBytes();
++            try ops.rewind(&e.m.ops, e.stream, e.sites.?.ptr, sites, e.c.hidden, backup, e.bd.hist, e.slot, q.row0, n);
++            st.pos[e.slot] = q.at + n;
++        } else if (n < q.rows) {
++            // bd.hist holds a later call's rows: restore the states and run the kept rows again (same bits)
+             try e.convCopy(e.slot, false);
+             st.pos[e.slot] = q.at;
+             const item = [_]fw.Item{.{ .slot = e.slot, .ids = q.ids[0..n] }};
+             try e.forward(&e.bd, e.shape_d).run(st, &item);
++            e.calls += 1;
+         }
+         q.rows = 0;
+     }
+ 
++    /// Every conv site's slot-0 state, hist offset (bd's rows), backup offset (convCopy's order), width: on the device.
++    fn siteTable(e: *Engine) !cuda.DeviceBuffer {
++        const st = &e.st.?;
++        const sites = try e.gpa.alloc(ops.RewindSite, @as(usize, e.c.layers) * 4);
++        defer e.gpa.free(sites);
++        var off: usize = 0;
++        for (st.conv, 0..) |cv, i| for (cv, 0..) |base, j| {
++            const c = if (j < 2) st.kv * e.c.head_dim else @as(usize, e.c.hidden);
++            const h = fw.histAt(&e.c, e.shape_d.kv, e.shape_d.rows, i, j);
++            sites[i * 4 + j] = .{ .state = base, .hist = @intCast(h), .backup = @intCast(off), .c = @intCast(c) };
++            off += 3 * c * 4;
++        };
++        return cuda.DeviceBuffer.fromHost(e.d, std.mem.sliceAsBytes(sites));
++    }
++
+     /// The slot's conv states to (out) or from its backup.
+     fn convCopy(e: *Engine, slot: usize, out: bool) !void {
+         const st = &e.st.?;
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 9076f2d..347e38f 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -42,6 +42,7 @@ pub const Shape = struct {
+     heads: usize, // the rank's query heads
+     kv: usize, // the rank's key heads
+     ring_rows: usize = 0, // rows a call may write into a sliding ring (0: rows)
++    hist: bool = false, // the calls keep each row's conv inputs (Buffers.hist), so a short keep needs no forward
+ 
+     pub fn sliding(s: Shape, c: *const cfg.Config) kernels.Layer {
+         return kernels.Layer.sliding(c.window, @intCast(if (s.ring_rows > 0) s.ring_rows else s.rows));
+@@ -136,6 +137,14 @@ pub const State = struct {
+     }
+ };
+ 
++/// Byte offset of layer `i`'s conv site `j` (k, v, attention, MLP) in a hist of `rows` rows: [rows][C] a site.
++pub fn histAt(c: *const cfg.Config, kv: usize, rows: usize, i: usize, j: usize) usize {
++    const kvw = kv * c.head_dim;
++    const layer = rows * (2 * kvw + 2 * @as(usize, c.hidden)) * 4;
++    const in = if (j < 2) j * rows * kvw * 4 else 2 * rows * kvw * 4 + (j - 2) * rows * @as(usize, c.hidden) * 4;
++    return i * layer + in;
++}
++
+ /// Rows a grouped-experts call takes: its grouping kernel holds rows x 8 picks in 64 KiB of shared memory.
+ const expert_rows = 2048;
+ 
+@@ -181,6 +190,7 @@ pub const Buffers = struct {
+     exs: cuda.exl3_experts.Scratch = undefined,
+     logits: Buf = undefined, // fp32 [rows][padded vocab of the rank]
+     taps: u64 = 0, // bf16 [rows][8][hidden]: the drafter's taps of these rows (the engine's, with a drafter)
++    hist: u64 = 0, // fp32 conv inputs of these rows, histAt's layout (Shape.hist; else 0)
+ 
+     /// Scratch for `s.rows` rows; `shared` partials, else its own for every row at the shape's context.
+     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, s: Shape, shared: ?Partials) !Buffers {
+@@ -227,6 +237,7 @@ pub const Buffers = struct {
+         const el = w.layers[0].experts;
+         b.exs = try cuda.exl3_experts.scratch(try A(&b, d, try cuda.exl3_experts.scratchBytes(el, @min(n, expert_rows), c.topk)), el, @min(n, expert_rows), c.topk);
+         b.logits = try Buf.alloc(d, n * w.share.vocab.len() * 4);
++        if (s.hist) b.hist = try A(&b, d, histAt(c, s.kv, n, c.layers, 0));
+         return b;
+     }
+ 
+@@ -316,6 +327,12 @@ pub const Forward = struct {
+         return f.gather(n);
+     }
+ 
++    /// Where layer `i`'s conv site `j` keeps its rows' inputs (0: this call's buffers keep none).
++    fn hist(f: Forward, i: usize, j: usize) u64 {
++        if (f.b.hist == 0) return 0;
++        return f.b.hist + histAt(&f.w.config, f.shape.kv, f.shape.rows, i, j);
++    }
++
+     fn dense(f: Forward, wt: cuda.exl3.Weight, x: u64, rows: usize, y: u64, dt: cuda.exl3.DType) !void {
+         try f.m.dense.decode(f.stream, wt, x, .bf16, rows, y, dt);
+     }
+@@ -417,8 +434,8 @@ pub const Forward = struct {
+                 try ops.rowdot(k, s, xk, a.k_proj, b.dk, n, f.shape.kv * c.conv, h, false, false);
+                 try ops.rowdot(k, s, xv, a.v_proj, b.dv, n, f.shape.kv * c.conv, h, false, false);
+             }
+-            try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw, .segs = conv_segs, .state_stride = @intCast(3 * kvw) }, streams);
+-            try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw, .segs = conv_segs, .state_stride = @intCast(3 * kvw) }, streams);
++            try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw, .segs = conv_segs, .hist = f.hist(i, 0), .state_stride = @intCast(3 * kvw) }, streams);
++            try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw, .segs = conv_segs, .hist = f.hist(i, 1), .state_stride = @intCast(3 * kvw) }, streams);
+             var lay_i = f.shape.layer(c, i);
+             lay_i.ring = @intCast(st.ring[@intFromBool(global)]); // the caches' rings, whatever rows this call's scratch holds
+             const rows = rows_by[@intFromBool(global)];
+@@ -434,7 +451,7 @@ pub const Forward = struct {
+                 try copy(f.d, b.blocks + nb * n * h * 2, b.x, n * h * 2, s);
+                 nb += 1;
+             }
+-            try ops.conv(k, s, .{ .x = ao.x, .parts = ao.parts, .part_stride = ao.stride, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1, .segs = conv_segs, .state_stride = @intCast(3 * h) }, streams);
++            try ops.conv(k, s, .{ .x = ao.x, .parts = ao.parts, .part_stride = ao.stride, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1, .segs = conv_segs, .hist = f.hist(i, 2), .state_stride = @intCast(3 * h) }, streams);
+             var mm: ops.MixArgs = .{ .partial = b.resid, .query = l.mlp_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 0, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+             for (0..nb) |j| mm.blocks[j] = b.blocks + j * n * h * 2;
+             mm.norm[0] = l.mlp_norm;
+@@ -450,7 +467,7 @@ pub const Forward = struct {
+                 try experts.run(&f.m.experts, k, s, l.experts, caps, b.normed + r0 * h * 2, h, .bf16, b.pick + sel, b.wts + sel, w, out + r0 * h * 4, b.exs);
+             }
+             const mo = try f.summed(b.moe, n);
+-            try ops.conv(k, s, .{ .x = mo.x, .parts = mo.parts, .part_stride = mo.stride, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2, .segs = conv_segs, .state_stride = @intCast(3 * h) }, streams);
++            try ops.conv(k, s, .{ .x = mo.x, .parts = mo.parts, .part_stride = mo.stride, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2, .segs = conv_segs, .hist = f.hist(i, 3), .state_stride = @intCast(3 * h) }, streams);
+         }
+         try f.tap(f.w.layers.len, n); // a truncated pack's taps past its last layer: the partial block at the end
+         var fm: ops.MixArgs = .{ .partial = b.x, .query = f.w.out_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+@@ -478,4 +495,8 @@ test "forward: a staged call's words sit where launch reads them" {
+     const c: cfg.Config = .{};
+     try std.testing.expectEqual(@as(u32, 5), stride(&c, 100));
+     try std.testing.expectEqual(@as(u32, 64), stride(&c, 1048575));
++    // per layer, rows x (k 512 + v 512 + attention 4608 + MLP 4608) fp32 at 4 key heads a rank
++    try std.testing.expectEqual(@as(usize, 2 * 512 * 4), histAt(&c, 4, 2, 0, 1));
++    try std.testing.expectEqual(@as(usize, 2 * (2 * 512 + 4608) * 4), histAt(&c, 4, 2, 0, 3));
++    try std.testing.expectEqual(@as(usize, 2 * 2 * (512 + 4608) * 4), histAt(&c, 4, 2, 1, 0));
+ }
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index 38074f5..b43e659 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -30,6 +30,7 @@ pub const ConvArgs = extern struct {
+     resid: u64 = 0,
+     out: u64 = 0,
+     segs: u64 = 0, // int4 per stream: row0, rows, state slot (0: one stream)
++    hist: u64 = 0, // fp32 [rows][c]: each row's input as the state keeps it (0: none)
+     part_stride: i64 = 0, // elements between the ranks' partials of x (parts > 1)
+     state_stride: i64 = 0, // elements between the streams' states
+     parts: i32 = 1,
+@@ -69,6 +70,7 @@ pub const Kernels = struct {
+     top1: cuda.Function,
+     tobf: cuda.Function,
+     put_words: cuda.Function,
++    rewind: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -86,6 +88,7 @@ pub const Kernels = struct {
+             .top1 = try mod.function("tf_ink2_top1"),
+             .tobf = try mod.function("tf_ink2_tobf"),
+             .put_words = try mod.function("tf_ink2_put_words"),
++            .rewind = try mod.function("tf_ink2_conv_rewind"),
+         };
+     }
+ 
+@@ -152,6 +155,17 @@ pub fn conv(k: *const Kernels, s: cuda.Stream, c: ConvArgs, streams: usize) !voi
+     try go(k.conv, s, .{ .x = @intCast(std.math.divCeil(i32, c.c, 128) catch unreachable), .y = @intCast(streams) }, 128, &a);
+ }
+ 
++/// ops.cu's RewindSite: a conv site's slot-0 state, byte offsets of its rows in a hist and in a slot's backup, its C.
++pub const RewindSite = extern struct { state: u64, hist: i64, backup: i64, c: i32, pad: i32 = 0 };
++
++/// A slot's last window keeps `n` rows: every site's state from its backup (`backup`: the slot's) and `hist` rows.
++pub fn rewind(k: *const Kernels, s: cuda.Stream, sites: u64, n_sites: usize, widest: usize, backup: u64, hist: u64, slot: usize, row0: usize, n: usize) !void {
++    var a: cuda.Args = .{};
++    for ([_]u64{ sites, backup, hist }) |v| a.add(v);
++    for ([_]i32{ int(slot), int(row0), int(n) }) |v| a.add(v);
++    try go(k.rewind, s, .{ .x = @intCast((widest + 127) / 128), .y = @intCast(n_sites) }, 128, &a);
++}
++
+ /// tanh(x / cap) * cap over `n` fp32 logits in place.
+ pub fn softcap(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, cap: f32) !void {
+     var a: cuda.Args = .{};
+@@ -200,6 +214,7 @@ pub fn putWords(k: *const Kernels, s: cuda.Stream, dst: u64, n: usize, words: Wo
+ 
+ test "ops: the argument structs keep ops.cu's layouts" {
+     try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
+-    try std.testing.expectEqual(@as(usize, 8 * 8 + 2 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
++    try std.testing.expectEqual(@as(usize, 9 * 8 + 2 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
++    try std.testing.expectEqual(@as(usize, 32), @sizeOf(RewindSite));
+     try std.testing.expectEqual(@as(usize, 6 * 8 + 6 * 4), @sizeOf(GateUpArgs));
+ }

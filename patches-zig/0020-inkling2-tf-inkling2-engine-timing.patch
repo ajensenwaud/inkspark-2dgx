@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:58:35 +1100
+Subject: [PATCH 20/45] inkling2: tf-inkling2-engine timing
+
+Times graphed windows by rows (one stream, 1-8 rows) and shared windows
+(2, 4 and 8 streams of 1, 2, 4 and 8 rows), the draft pass for 1, 2, 4
+and 8 streams, and a keep of one row out of eight by rewind and by the
+old re-run: the median of 16 calls after 3 warm ones, rows of real text.
+It prints the lone table in the shape lanes' window_costs take.
+---
+ zig/src/families/inkling2/engine_main.zig   |  4 +-
+ zig/src/families/inkling2/engine_timing.zig | 89 +++++++++++++++++++++
+ 2 files changed, 92 insertions(+), 1 deletion(-)
+ create mode 100644 zig/src/families/inkling2/engine_timing.zig
+
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index 80ee60f..2d1fa09 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -3,11 +3,12 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const ink = @import("inkling2");
+ 
+-const usage = "usage: tf-inkling2-engine graphs|greedy|drafts|images <model dir> <ids.json> <out dir> [context] [new tokens]\n" ++
++const usage = "usage: tf-inkling2-engine graphs|greedy|drafted|drafts|images|timing <model dir> <ids.json> <out dir> [context] [new]\n" ++
+     "  graphs: decode windows eager in some slots and graphed in others on the same rows; logits must match bit for bit\n" ++
+     "  greedy: each text's prompt pass then greedy decode rows, eager (writes greedy.json: name -> tokens)\n" ++
+     "  drafts: the drafter at ~12 anchors a text after a prompt pass to each (drafts.json, drafts-r<rank>.bin)\n" ++
+     "  images: <ids.json> is a directory of NAME.png + NAME.ids.u32; spliced rows, solo/drafted/concurrent greedy\n" ++
++    "  timing: graphed windows by rows and streams, draft passes, a short keep (median ms of 16 after 3 warm)\n" ++
+     "  two ranks: TF_INKLING2_RANK, TF_INKLING2_WORLD and NCCL_COMM_ID on both\n";
+ 
+ const Text = struct { name: []const u8, ids: []u32 };
+@@ -61,6 +62,7 @@ pub fn main(init: std.process.Init) !u8 {
+     const r0 = place.rank == 0;
+     if (std.mem.eql(u8, args[1], "drafts")) return drafts(e, a, io, out, list.items, place.rank);
+     if (pics) return @import("engine_images.zig").run(e, a, io, args[3], out, new, r0);
++    if (std.mem.eql(u8, args[1], "timing")) return @import("engine_timing.zig").run(e, a, io, list.items, r0);
+     if (std.mem.eql(u8, args[1], "drafted")) {
+         var bad: usize = 0;
+         for (list.items) |t| {
+diff --git a/zig/src/families/inkling2/engine_timing.zig b/zig/src/families/inkling2/engine_timing.zig
+new file mode 100644
+index 0000000..00c7154
+--- /dev/null
++++ b/zig/src/families/inkling2/engine_timing.zig
+@@ -0,0 +1,89 @@
++//! tf-inkling2-engine timing: graphed window costs by rows and streams, the draft pass, and a short keep, in ms.
++const std = @import("std");
++const ink = @import("inkling2");
++
++const Engine = ink.engine.Engine;
++
++/// Replays timed a cell after the warm ones (medians; a mean of a few swung 10 % between starts on MiMo).
++const reps = 16;
++const warm = 3;
++
++/// Every cell on `k` slots holding the texts' prompts; rank 0 prints a line a cell and the lone table for lanes.zig.
++pub fn run(e: *Engine, a: std.mem.Allocator, io: std.Io, texts: anytype, r0: bool) !u8 {
++    if (texts.len == 0) return error.NoTexts;
++    var lone: [ink.engine.window_rows]f64 = undefined;
++    for (1..ink.engine.window_rows + 1) |rows| {
++        lone[rows - 1] = try cell(e, a, io, texts, 1, rows, .verify);
++        if (r0) std.debug.print("window 1 stream x {d} rows: {d:.2} ms\n", .{ rows, lone[rows - 1] });
++    }
++    for ([_]usize{ 2, 4, 8 }) |k| for ([_]usize{ 1, 2, 4, 8 }) |rows| {
++        const ms = try cell(e, a, io, texts, k, rows, .verify);
++        if (r0) std.debug.print("shared {d} streams x {d} rows ({d} rows): {d:.2} ms\n", .{ k, rows, k * rows, ms });
++    };
++    if (e.drafter != null) for ([_]usize{ 1, 2, 4, 8 }) |k| {
++        const ms = try cell(e, a, io, texts, k, 1, .draft);
++        if (r0) std.debug.print("draft pass, {d} streams: {d:.2} ms\n", .{ k, ms });
++    };
++    for ([_]Cell{ .rewind, .rerun }) |what| {
++        const ms = try cell(e, a, io, texts, 1, ink.engine.window_rows, what);
++        if (r0) std.debug.print("keep 1 of {d} rows by {s}: {d:.2} ms\n", .{ ink.engine.window_rows, @tagName(what), ms });
++    }
++    if (r0) {
++        std.debug.print("lone window ms by rows (lanes window_costs): {{", .{});
++        for (lone, 0..) |ms, i| std.debug.print("{s}{d:.1}", .{ if (i > 0) ", " else " ", ms });
++        std.debug.print(" }}\n", .{});
++    }
++    return 0;
++}
++
++const Cell = enum { verify, draft, rewind, rerun };
++
++/// Median ms of `reps` timed calls: a verify of k windows of `rows`, a draft pass for k streams, or a keep of 1 row.
++fn cell(e: *Engine, a: std.mem.Allocator, io: std.Io, texts: anytype, k: usize, rows: usize, what: Cell) !f64 {
++    var pend: [8]u32 = undefined;
++    var src: [8][]const u32 = undefined;
++    for (0..k) |i| {
++        src[i] = texts[i % texts.len].ids;
++        try e.bind(@intCast(i));
++        e.begin(null);
++        var p: usize = 0;
++        pend[i] = while (true) : (p += ink.engine.prompt_rows) {
++            if (try e.prefillChunk(src[i], p)) |t| break t;
++        };
++    }
++    const ms = try a.alloc(f64, reps);
++    var step: usize = 0;
++    while (step < warm + reps) : (step += 1) {
++        var ids: [8][8]u32 = undefined;
++        var outs: [8][8]u32 = undefined;
++        var parts: [8]ink.engine.Part = undefined;
++        for (0..k) |i| {
++            ids[i][0] = pend[i];
++            for (1..rows) |r| ids[i][r] = src[i][(step * rows + r) % src[i].len]; // real tokens: rows route like text
++            parts[i] = .{ .slot = @intCast(i), .ids = ids[i][0..rows], .out = outs[i][0..rows] };
++        }
++        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++        switch (what) {
++            .verify, .rewind, .rerun => try e.verifyShared(parts[0..k]),
++            .draft => {
++                var reqs: [8]ink.engine.Req = undefined;
++                var drafts: [8][7]u32 = undefined;
++                for (0..k) |i| reqs[i] = .{ .slot = @intCast(i), .n = 0, .anchor = pend[i], .out = &drafts[i] };
++                try e.draftBlock(reqs[0..k]);
++            },
++        }
++        const t1 = std.Io.Clock.awake.now(io).toNanoseconds();
++        for (0..k) |i| {
++            try e.bind(@intCast(i));
++            if (what == .rerun) e.calls += 1; // the hist rows look stale: keep runs its forward
++            if (what != .draft) try e.keep(if (what == .verify) rows else 1);
++        }
++        try e.stream.synchronize();
++        const t2 = std.Io.Clock.awake.now(io).toNanoseconds();
++        const ns = if (what == .rewind or what == .rerun) t2 - t1 else t1 - t0;
++        if (step >= warm) ms[step - warm] = @as(f64, @floatFromInt(ns)) / 1e6;
++        for (0..k) |i| pend[i] = if (what == .draft) pend[i] else outs[i][if (what == .verify) rows - 1 else 0];
++    }
++    std.mem.sort(f64, ms, {}, std.sort.asc(f64));
++    return ms[reps / 2];
++}

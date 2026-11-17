@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 07:05:02 +1100
+Subject: [PATCH 31/45] environment: register TF_INKLING2_PROFILE
+
+Strict reads panic on an unregistered name, so the profile switch took
+the serve down at start.
+---
+ docs/environment.md                   | 1 +
+ zig/src/platform/environment.zig      | 1 +
+ zig/src/platform/environment_test.zig | 1 +
+ 3 files changed, 3 insertions(+)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 555c93a..2c6a5fb 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -42,6 +42,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_GLM_DRAFT_CONFIDENCE` | Finite number 0 through 1 where a DFlash2 chain's chance product stops it; default 0.7 |
+ | `TF_INKLING2_RANK` | Inkling 2 on CUDA: this rank, a whole number below `TF_INKLING2_WORLD`; set both or neither |
+ | `TF_INKLING2_WORLD` | Inkling 2 on CUDA: whole rank count from 1; the family admits exactly 2 |
++| `TF_INKLING2_PROFILE` | Inkling 2 on CUDA: `1` times a round's phases on each rank and logs a line every 200 rounds (syncs the forward; off by default) |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_FLASHNEXT_SCALE_INDEX` | Flash Next on Metal before tensor units: exactly `0` or `1`; `1` has the 4-bit expert kernels read each group's scale and bias through a 16-bit index into its tensor's table of pairs, the same values with fewer weight bytes; default 0 |
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index 53a32fb..a283cd2 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -157,6 +157,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_DSV41_ROWS_CAP", .scope = .dsv41, .kind = .u32, .only = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 48, 64 }, .forms = "1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 24, 32, 48 or 64" },
+     .{ .name = "TF_INKLING2_RANK", .scope = .cuda, .kind = .u32, .forms = "a whole rank number, below TF_INKLING2_WORLD" },
+     .{ .name = "TF_INKLING2_WORLD", .scope = .cuda, .kind = .u32, .min = 1, .forms = "a whole rank count from 1 (Inkling 2 admits 2)" },
++    .{ .name = "TF_INKLING2_PROFILE", .scope = .cuda, .kind = .flag, .forms = "0 or 1" },
+ };
+ 
+ pub fn rule(name: []const u8) Rule {
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 20b8213..ae9d840 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -99,6 +99,7 @@ const valid = [_]Case{
+     .{ .name = "TF_SLIDE_FORGET_FAIL", .raw = " 0 ", .n = 0 },
+     .{ .name = "TF_INKLING2_RANK", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_WORLD", .raw = "2", .n = 2 },
++    .{ .name = "TF_INKLING2_PROFILE", .raw = "1", .n = 1 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {

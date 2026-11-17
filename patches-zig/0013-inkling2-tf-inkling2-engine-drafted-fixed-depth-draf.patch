@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 11:33:51 +1100
+Subject: [PATCH 13/45] inkling2: tf-inkling2-engine drafted, fixed-depth
+ drafted greedy against plain greedy
+
+Each window is the pending token plus a 7-draft block, verified in one 8-row
+window with the agreeing rows kept, eager and graphed; an oracle arm drafts
+plain greedy's own next tokens with one spoiled per window, so every kept count
+from 1 to 8 runs. Two comments shortened for the lean check.
+---
+ zig/src/families/inkling2/engine_main.zig | 52 +++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index 7dda55c..ba54840 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -56,6 +56,22 @@ pub fn main(init: std.process.Init) !u8 {
+     defer out.close(io);
+     const r0 = place.rank == 0;
+     if (std.mem.eql(u8, args[1], "drafts")) return drafts(e, a, io, out, list.items, place.rank);
++    if (std.mem.eql(u8, args[1], "drafted")) {
++        var bad: usize = 0;
++        for (list.items) |t| {
++            e.graphs.settings.on = false;
++            const plain = try greedy(e, a, t.ids, new + 8);
++            for ([_]u8{ 0, 1, 2 }) |arm| {
++                e.graphs.settings.on = arm == 1;
++                const d = try draftedGreedy(e, a, t.ids, new, if (arm == 2) plain else null);
++                const same = std.mem.eql(u32, plain[0..new], d.toks[0..new]);
++                bad += @intFromBool(!same);
++                const what = [_][]const u8{ "eager", "graphed", "oracle drafts" };
++                if (r0) std.debug.print("{s} {s}: drafted == plain {s}; accepted {d}/{d} drafts in {d} windows\n", .{ t.name, what[arm], if (same) "PASS" else "FAIL", d.acc, d.drafted, d.windows });
++            }
++        }
++        return if (bad == 0) 0 else 1;
++    }
+     if (!graphs) {
+         e.graphs.settings.on = false;
+         var json: std.ArrayList(u8) = .empty;
+@@ -95,6 +111,42 @@ pub fn main(init: std.process.Init) !u8 {
+     return if (pass == total) 0 else 1;
+ }
+ 
++/// Greedy decode with a 7-draft block before every window: one 8-row window, the agreeing rows kept (fixed depth).
++/// With `oracle` (plain greedy's tokens) the drafts are its next tokens, one of them spoiled per window in turn.
++fn draftedGreedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize, oracle: ?[]const u32) !struct { toks: []u32, acc: usize, drafted: usize, windows: usize } {
++    try e.bind(0);
++    e.begin(null);
++    var at: usize = 0;
++    var tok: u32 = while (true) : (at += ink.engine.prompt_rows) {
++        if (try e.prefillChunk(ids, at)) |t| break t;
++    };
++    var toks: std.ArrayList(u32) = .empty;
++    var kept: u32 = 0;
++    var acc: usize = 0;
++    var windows: usize = 0;
++    while (toks.items.len < n) : (windows += 1) {
++        var w: [8]u32 = undefined;
++        w[0] = tok;
++        try e.draftBlock(&.{.{ .slot = 0, .n = kept, .anchor = tok, .out = w[1..8] }});
++        if (oracle) |orc| {
++            const m = toks.items.len;
++            for (1..8) |j| w[j] = orc[m + j];
++            const c = windows % 8;
++            if (c < 7) w[1 + c] ^= 1;
++        }
++        var o: [8]u32 = undefined;
++        try e.verifyShared(&.{.{ .slot = 0, .ids = &w, .out = &o }});
++        var k: usize = 1;
++        while (k < 8 and w[k] == o[k - 1]) k += 1;
++        try e.keep(k);
++        try toks.appendSlice(a, w[0..k]);
++        acc += k - 1;
++        kept = @intCast(k);
++        tok = o[k - 1];
++    }
++    return .{ .toks = toks.items, .acc = acc, .drafted = 7 * windows, .windows = windows };
++}
++
+ /// A text's prompt pass on the bound slot then `n` greedy tokens, one decode row at a time.
+ fn greedy(e: *ink.engine.Engine, a: std.mem.Allocator, ids: []const u32, n: usize) ![]u32 {
+     try e.bind(0);

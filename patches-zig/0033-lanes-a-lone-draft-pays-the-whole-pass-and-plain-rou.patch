@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 11:55:06 +1100
+Subject: [PATCH 33/45] lanes: a lone draft pays the whole pass, and plain
+ rounds probe the depth that would win
+
+A block head that drafts its whole block in one pass (draft_passes)
+was priced at mtp_step_ms a draft in lone rounds, so an untimed depth
+looked cheap or, after a short timed round, every deep one looked dear.
+Out of plain rounds the probe drafted one, the depth that pays least
+for the pass, at doubling waits up to 128 rounds. Seeded replies with
+identical text drafted 0.9 to 4.0 a round from run to run on Inkling 2.
+---
+ zig/src/core/lanes/depth.zig | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 658c68d..a475a2d 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -129,14 +129,14 @@ pub const Rule = struct {
+         const table = try r.costs(who);
+         if (table.get(drafts)) |v| return v;
+         const forward = r.family_costs.get(drafts + 1) orelse return null;
+-        var modeled = forward + r.mtp_step_ms * @as(f64, @floatFromInt(drafts));
++        var modeled = forward + r.mtp_step_ms * @as(f64, @floatFromInt(r.headSteps(drafts)));
+         if (r.plain_guard) {
+             // untimed: its model plus the least time a row of a timed round took beyond its model
+             var least: ?f64 = null;
+             for (table.slots, 0..) |slot, d| {
+                 const ms = slot orelse continue;
+                 const fc = r.family_costs.get(@intCast(d + 1)) orelse continue;
+-                const beyond = (ms - fc - r.mtp_step_ms * @as(f64, @floatFromInt(d))) / @as(f64, @floatFromInt(d + 1));
++                const beyond = (ms - fc - r.mtp_step_ms * @as(f64, @floatFromInt(r.headSteps(@intCast(d))))) / @as(f64, @floatFromInt(d + 1));
+                 least = if (least) |l| (if (beyond < l) beyond else l) else beyond;
+             }
+             const floor = least orelse 0.0;
+@@ -145,6 +145,11 @@ pub const Rule = struct {
+         return modeled;
+     }
+ 
++    /// Head steps a lone round of `drafts` runs: a pass that drafts its whole block (draft_passes) runs them all.
++    fn headSteps(r: *const Rule, drafts: i64) i64 {
++        return if (r.draft_passes and drafts > 0) r.most_drafts else drafts;
++    }
++
+     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
+     pub fn depth(r: *Rule, who: Who) !i64 {
+         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
+@@ -157,6 +162,8 @@ pub const Rule = struct {
+         }
+         var best: i64 = 1;
+         var best_rate: f64 = -1.0;
++        var drafted: i64 = 1; // the best drafted depth: what a probe out of plain rounds tries
++        var drafted_rate: f64 = -1.0;
+         if (r.plain_guard) {
+             if (try r.roundCost(0, who)) |plain| {
+                 if (plain != 0.0) { // a draft must beat plain by plain_margin: estimates near the line are noise
+@@ -173,6 +180,10 @@ pub const Rule = struct {
+             const at: usize = @intCast(d - 1);
+             run *= if (at < p.len) p[at] else p[p.len - 1];
+             expected += run;
++            if (expected / cost > drafted_rate) {
++                drafted = d;
++                drafted_rate = expected / cost;
++            }
+             if (expected / cost > best_rate) {
+                 best = d;
+                 best_rate = expected / cost;
+@@ -180,7 +191,7 @@ pub const Rule = struct {
+         }
+         const st = &who.state.*.?;
+         st.rounds += 1;
+-        if (best == 0) return @intFromBool(r.probePlain(st));
++        if (best == 0) return if (r.probePlain(st)) drafted else 0;
+         st.plain = 0;
+         st.wait = r.k.depth_probe_every;
+         if (best < most and st.rounds % r.k.depth_probe_every == 0) best += 1;

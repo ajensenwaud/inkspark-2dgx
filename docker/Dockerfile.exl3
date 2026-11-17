@@ -1,0 +1,30 @@
+# InkSpark quantiser image: exllamav3 v1.6.6 (the converter and the reference forward) plus the transformers
+# commit that added inkling2 (huggingface/transformers PR #50682), used as the architecture reference.
+#
+# The base is the local ling-exl3 image: NVIDIA PyTorch 26.07 (torch 2.13, CUDA 13.3) with exllamav3 compiled
+# for sm_121 at bd1f519172, which is the v1.6.6 tag, so nothing is recompiled here.
+# The Inkling 2 architecture itself is a Python overlay (tools/exl3/overlay), bind-mounted over
+# site-packages/exllamav3 at run time so edits need no rebuild.
+#
+# Build (on a node that has ling-exl3:latest):
+#   DOCKER_BUILDKIT=0 docker build --memory 9g --memory-swap 9g -t inkspark-exl3 -f docker/Dockerfile.exl3 docker
+
+ARG BASE_IMAGE=ling-exl3:latest
+FROM ${BASE_IMAGE}
+
+ARG EXL3_COMMIT=bd1f519172406a9560bd5c90e61000691bb69a07
+ARG TRANSFORMERS_COMMIT=109a7d19bf667168837f32929e00b791e195d14d
+
+# Fail the build if the base does not carry the pinned exllamav3
+RUN cd / && test "$(cat /opt/exllamav3.commit 2>/dev/null || git -C /opt/exllamav3 rev-parse HEAD)" = "${EXL3_COMMIT}" \
+    && python3 -c "import exllamav3.version as v; assert v.__version__ == '1.6.6', v.__version__"
+
+# transformers at the inkling2 merge commit, without touching the image's torch or other packages
+RUN cd / && pip install --no-cache-dir --no-deps \
+        "transformers @ git+https://github.com/huggingface/transformers.git@${TRANSFORMERS_COMMIT}" \
+    && python3 -c "from transformers.models.inkling2.modeling_inkling2 import Inkling2ForCausalLM; \
+import transformers; print('transformers', transformers.__version__)"
+
+LABEL org.opencontainers.image.title=inkspark-exl3 \
+      io.exllamav3.revision=${EXL3_COMMIT} \
+      io.transformers.revision=${TRANSFORMERS_COMMIT}

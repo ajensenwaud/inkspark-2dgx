@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:58:35 +1100
+Subject: [PATCH 19/45] inkling2: sampled streams' drafts race with the
+ stream's own keys
+
+The drafter walked greedily at every temperature, so at T 1.0 a draft
+landed only when the target's keyed sample happened to be the
+drafter's top token. Each walk step of a sampled stream now runs the
+same Gumbel race main's sample.cu runs, with the request's seed and
+1 / T at the position the draft's token will take. When the two
+distributions agree the race lands on the token the verify draws.
+
+The output does not change: the verify still draws its own keyed
+sample and keeps a draft only when they are equal. The race ignores
+top_k and top_p, which costs some agreement when the request cuts.
+
+Not run on a GPU yet; tf_ink2_race1 has no kernel contract.
+---
+ zig/kernels/cuda/inkling2/ops.cu         | 68 ++++++++++++++++++++++++
+ zig/src/families/inkling2/dspark_run.zig | 11 ++--
+ zig/src/families/inkling2/engine.zig     |  4 +-
+ zig/src/families/inkling2/ops.zig        | 16 ++++++
+ 4 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index 4c83f7b..dab678d 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -387,6 +387,74 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ink2_top1(const float* __r
+     }
+ }
+ 
++namespace ink2r {
++
++// sample.cu's keys, unchanged: a draft raced with them lands on the token a keyed draw at that position would take
++__device__ __forceinline__ unsigned long long mix(unsigned long long x) {
++    x ^= x >> 30;
++    x *= 0xBF58476D1CE4E5B9ull;
++    x ^= x >> 27;
++    x *= 0x94D049BB133111EBull;
++    return x ^ (x >> 31);
++}
++
++__device__ __forceinline__ float race_uniform(unsigned long long seed, unsigned pos, unsigned id) {
++    unsigned long long x = mix(seed + 0x9E3779B97F4A7C15ull);
++    x = mix(x ^ (static_cast<unsigned long long>(pos) * 0xD1B54A32D192ED03ull));
++    x = mix(x ^ static_cast<unsigned long long>(id));
++    const float u = (static_cast<float>(static_cast<unsigned>(x >> 40)) + 0.5f) * (1.0f / 16777216.0f);
++    return fminf(u, __uint_as_float(0x3F7FFFFFu));
++}
++
++}  // namespace ink2r
++
++// One fp32 row's Gumbel race at `pos` under sample.cu's keys (ids base + i): the best score and its id.
++extern "C" __global__ void __launch_bounds__(1024) tf_ink2_race1(const float* __restrict__ x, int n, int base,
++                                                                 unsigned long long seed, float inv_t, unsigned pos,
++                                                                 float* __restrict__ val, int* __restrict__ id) {
++    using namespace ink2o;
++    __shared__ float sv[32];
++    __shared__ int si[32];
++    float bv = -INFINITY;
++    int bi = 0x7fffffff;
++    for (int i = threadIdx.x; i < n; i += blockDim.x) {
++        const float v = bfr(x[i]) * inv_t - logf(-logf(ink2r::race_uniform(seed, pos, static_cast<unsigned>(base + i))));
++        if (better(v, i, bv, bi)) {
++            bv = v;
++            bi = i;
++        }
++    }
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++        if (better(ov, oi, bv, bi)) {
++            bv = ov;
++            bi = oi;
++        }
++    }
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    if (lane == 0) {
++        sv[warp] = bv;
++        si[warp] = bi;
++    }
++    __syncthreads();
++    if (warp != 0) return;
++    bv = lane < static_cast<int>(blockDim.x >> 5) ? sv[lane] : -INFINITY;
++    bi = lane < static_cast<int>(blockDim.x >> 5) ? si[lane] : 0x7fffffff;
++    for (int o = 16; o > 0; o >>= 1) {
++        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
++        if (better(ov, oi, bv, bi)) {
++            bv = ov;
++            bi = oi;
++        }
++    }
++    if (lane == 0) {
++        val[0] = bv;
++        id[0] = (bi == 0x7fffffff ? 0 : bi) + base;
++    }
++}
++
+ // fp32 logits rows into bf16 whole rows at column col0: the first n columns rounded, the rest of `width` -inf.
+ extern "C" __global__ void tf_ink2_tobf(const float* __restrict__ x, long long stride, int n, uint16_t* __restrict__ out,
+                                         long long out_stride, long long col0, int width) {
+diff --git a/zig/src/families/inkling2/dspark_run.zig b/zig/src/families/inkling2/dspark_run.zig
+index 50f4a86..10e785f 100644
+--- a/zig/src/families/inkling2/dspark_run.zig
++++ b/zig/src/families/inkling2/dspark_run.zig
+@@ -52,6 +52,9 @@ pub fn initSlot(d: *const cuda.Driver, c: *const ds.Config, kv: usize, capacity:
+     return s;
+ }
+ 
++/// A sampled stream's keys (sample.cu's seed and 1 / T): its drafts race as its target draws will, not greedily.
++pub const Race = struct { seed: u64, inv_t: f32 };
++
+ pub const Drafter = struct {
+     gpa: std.mem.Allocator,
+     d: *const cuda.Driver,
+@@ -204,8 +207,8 @@ pub const Drafter = struct {
+         slot.to = p0 + rows;
+     }
+ 
+-    /// A block at anchor position `p` (its context absorbed below p): `n` greedy drafts into `out`, every rank alike.
+-    pub fn draft(dr: *Drafter, m: *fw.Modules, s: cuda.Stream, ex: fw.Exchange, t: anytype, slot: *Slot, anchor: u32, p: usize, out: []u32) !void {
++    /// A block at anchor `p` (context absorbed below p): `n` drafts, greedy or raced as the verify draws (`race`).
++    pub fn draft(dr: *Drafter, m: *fw.Modules, s: cuda.Stream, ex: fw.Exchange, t: anytype, slot: *Slot, anchor: u32, p: usize, race: ?Race, out: []u32) !void {
+         const c = &dr.w.c;
+         const h = dr.hidden;
+         const n = out.len;
+@@ -246,7 +249,9 @@ pub const Drafter = struct {
+             try dk.vocab(&dr.k, s, dr.base + j * dr.nv * 2, dr.latent, dr.fold, dr.fbias, dr.cap, dr.valid, dr.nv, dr.scores);
+             if (dr.keep_logits != 0) try dr.copy(s, dr.keep_logits + j * dr.nv * 4, dr.scores, dr.nv * 4);
+             const mine = dr.picks + dr.rank * 8;
+-            try ops.top1(&m.ops, s, dr.scores, 1, dr.nv, dr.nv, dr.vlo, mine, mine + 4);
++            if (race) |r| {
++                try ops.race1(&m.ops, s, dr.scores, dr.valid, dr.vlo, r.seed, r.inv_t, p + 1 + j, mine, mine + 4);
++            } else try ops.top1(&m.ops, s, dr.scores, 1, dr.nv, dr.nv, dr.vlo, mine, mine + 4);
+             switch (ex) {
+                 .local => {},
+                 .nccl => |x| if (x.group) |g| try g.allGather(s, mine, dr.picks, 8) else try x.lib.check(x.lib.api.ncclAllGather(mine, dr.picks, 8, .u8, x.comm, s.handle), "ncclAllGather"),
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 273fb45..f59aee7 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -470,7 +470,9 @@ pub const Engine = struct {
+             const s = &e.dslots[r.slot];
+             const at = e.pos();
+             if (r.n > 0) try dr.absorb(e.stream, s, s.stash, r.n, at - r.n);
+-            if (r.out.len > 0) try dr.draft(&e.m, e.stream, e.exchange, &e.w, s, r.anchor, at, r.out);
++            // a sampled stream's drafts race with its own keys: drafts its verify will draw, the output unchanged
++            const race: ?drun.Race = if (e.seqs[r.slot].sampling) |sm| .{ .seed = sampler.rule(sm).seed, .inv_t = sampler.rule(sm).inv_t } else null;
++            if (r.out.len > 0) try dr.draft(&e.m, e.stream, e.exchange, &e.w, s, r.anchor, at, race, r.out);
+         }
+     }
+ 
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index b43e659..1dc1b96 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -71,6 +71,7 @@ pub const Kernels = struct {
+     tobf: cuda.Function,
+     put_words: cuda.Function,
+     rewind: cuda.Function,
++    race1: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -89,6 +90,7 @@ pub const Kernels = struct {
+             .tobf = try mod.function("tf_ink2_tobf"),
+             .put_words = try mod.function("tf_ink2_put_words"),
+             .rewind = try mod.function("tf_ink2_conv_rewind"),
++            .race1 = try mod.function("tf_ink2_race1"),
+         };
+     }
+ 
+@@ -187,6 +189,20 @@ pub fn top1(k: *const Kernels, s: cuda.Stream, x: u64, rows: usize, stride: usiz
+     try go(k.top1, s, .{ .x = @intCast(rows) }, 1024, &a);
+ }
+ 
++/// One fp32 row's keyed Gumbel race at position `pos` (sample.cu's keys, ids `base` + i): best score and id.
++pub fn race1(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, base: usize, seed: u64, inv_t: f32, pos: usize, val: u64, id: u64) !void {
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(int(n));
++    a.add(int(base));
++    a.add(seed);
++    a.add(inv_t);
++    a.add(@as(u32, @intCast(pos)));
++    a.add(val);
++    a.add(id);
++    try go(k.race1, s, .{ .x = 1 }, 1024, &a);
++}
++
+ /// `rows` fp32 rows into bf16 rows of `out` at column `col0`: `n` columns rounded, the rest of `width` set to -inf.
+ pub fn tobf(k: *const Kernels, s: cuda.Stream, x: u64, rows: usize, stride: usize, n: usize, out: u64, out_stride: usize, col0: usize, width: usize) !void {
+     var a: cuda.Args = .{};

@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:49:54 +1100
+Subject: [PATCH 10/45] server: Inkling 2's replies split into reasoning,
+ content and tool calls
+
+The block split moves next to the other native reply readers, and chat_generation asks it for
+whole and streamed replies when the tokenizer holds Inkling's markers.
+---
+ zig/src/families/inkling2/chat.zig            | 32 +++++++----
+ zig/src/families/inkling2/inkling2.zig        |  3 -
+ zig/src/server/chat_generation.zig            |  3 +-
+ zig/src/server/chat_inkling.zig               | 56 +++++++++++++++++++
+ .../reply.zig => server/inkling_reply.zig}    |  0
+ zig/src/server/root.zig                       |  1 +
+ 6 files changed, 80 insertions(+), 15 deletions(-)
+ create mode 100644 zig/src/server/chat_inkling.zig
+ rename zig/src/{families/inkling2/reply.zig => server/inkling_reply.zig} (100%)
+
+diff --git a/zig/src/families/inkling2/chat.zig b/zig/src/families/inkling2/chat.zig
+index 297b1f7..de1dc1d 100644
+--- a/zig/src/families/inkling2/chat.zig
++++ b/zig/src/families/inkling2/chat.zig
+@@ -1,7 +1,17 @@
+ //! Inkling 2's chat wiring: the block markers' ids from tokenizer_config.json, the stop ids and the template's checks.
+ const std = @import("std");
+ const cfg = @import("config.zig");
+-const reply = @import("reply.zig");
++/// The release's block markers (special tokens in tokenizer_config.json) the server's reply split reads.
++pub const markers = struct {
++    pub const model = "<|message_model|>";
++    pub const text = "<|content_text|>";
++    pub const thinking = "<|content_thinking|>";
++    pub const end = "<|end_message|>";
++    pub const end_sampling = "<|content_model_end_sampling|>";
++    pub const tool_json = "<|content_invoke_tool_json|>";
++    pub const tool_text = "<|content_invoke_tool_text|>";
++    pub const tool_error = "<|content_tool_error|>";
++};
+ 
+ /// The special tokens the template writes and the reply split reads, by id.
+ pub const Tokens = struct {
+@@ -26,18 +36,18 @@ pub const Tokens = struct {
+ const names = [_]struct { field: []const u8, text: []const u8 }{
+     .{ .field = "endoftext", .text = "<|endoftext|>" },
+     .{ .field = "user", .text = "<|message_user|>" },
+-    .{ .field = "model", .text = reply.markers.model },
++    .{ .field = "model", .text = markers.model },
+     .{ .field = "system", .text = "<|message_system|>" },
+     .{ .field = "tool", .text = "<|message_tool|>" },
+-    .{ .field = "text", .text = reply.markers.text },
++    .{ .field = "text", .text = markers.text },
+     .{ .field = "image_block", .text = "<|content_image|>" },
+-    .{ .field = "end_sampling", .text = reply.markers.end_sampling },
+-    .{ .field = "thinking", .text = reply.markers.thinking },
+-    .{ .field = "end", .text = reply.markers.end },
+-    .{ .field = "tool_error", .text = reply.markers.tool_error },
++    .{ .field = "end_sampling", .text = markers.end_sampling },
++    .{ .field = "thinking", .text = markers.thinking },
++    .{ .field = "end", .text = markers.end },
++    .{ .field = "tool_error", .text = markers.tool_error },
+     .{ .field = "xml", .text = "<|content_xml|>" },
+-    .{ .field = "tool_json", .text = reply.markers.tool_json },
+-    .{ .field = "tool_text", .text = reply.markers.tool_text },
++    .{ .field = "tool_json", .text = markers.tool_json },
++    .{ .field = "tool_text", .text = markers.tool_text },
+     .{ .field = "image", .text = "<|unused_200054|>" },
+ };
+ 
+@@ -83,9 +93,9 @@ pub fn stops(c: *const cfg.Config, tok: *const Tokens) Error![]const u32 {
+     return error.Inkling2StopMismatch;
+ }
+ 
+-/// The template must write the blocks reply.zig splits and take the effort switch; any other format is refused.
++/// The template must write the blocks the server splits and take the effort switch; any other format is refused.
+ pub fn checkTemplate(template: []const u8) Error!void {
+-    const needed = [_][]const u8{ reply.markers.model, reply.markers.thinking, reply.markers.text, reply.markers.end, reply.markers.tool_json, reply.markers.end_sampling, "reasoning_effort", "tool_declare" };
++    const needed = [_][]const u8{ markers.model, markers.thinking, markers.text, markers.end, markers.tool_json, markers.end_sampling, "reasoning_effort", "tool_declare" };
+     for (needed) |n| if (std.mem.indexOf(u8, template, n) == null) return error.Inkling2TemplateMismatch;
+ }
+ 
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index aa2c32f..34e173b 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -1,8 +1,6 @@
+-//! Inkling 2 Small (model_type inkling2) on CUDA: config, chat, reply split, admission, kernels, EXL3 weights, forward.
+ 
+ pub const config = @import("config.zig");
+ pub const chat = @import("chat.zig");
+-pub const reply = @import("reply.zig");
+ pub const admit = @import("admit.zig");
+ pub const kernels = @import("kernels.zig");
+ pub const ops = @import("ops.zig");
+@@ -18,7 +16,6 @@ pub const model_type = "inkling2";
+ test {
+     _ = config;
+     _ = chat;
+-    _ = reply;
+     _ = admit;
+     _ = kernels;
+     _ = ops;
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+index e61bc84..ab2f253 100644
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -108,6 +108,7 @@ pub const Generation = struct {
+         const all = try g.visible.extend(g.a, g.srv.text, reply_text.decodeText, fresh.items);
+         if (g.visible.pending()) return; // a character still split across tokens
+         if (g.srv.text.vtable.format == .kimi) return @import("chat_kimi.zig").stream(g, sink);
++        if (@import("chat_inkling.zig").is(g.srv.text)) return @import("chat_inkling.zig").stream(g, sink);
+         const raw_visible = g.stops.visible(all, true);
+         const text = try @import("tool_minimax.zig").dsml(g.a, raw_visible, g.tools); // MiniMax-M3's calls as DSML
+         var answer = text;
+@@ -231,7 +232,7 @@ pub const Generation = struct {
+         const finished_ns = nowNs(g.srv.io);
+         const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
+         const raw = try g.srv.text.decode(a, content_tokens);
+-        const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else null;
++        const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else if (@import("chat_inkling.zig").is(g.srv.text)) try @import("chat_inkling.zig").read(g, content_tokens, true) else null;
+         const raw_visible = g.stops.visible(raw, false);
+         const visible = if (native) |n| n.content else try @import("tool_minimax.zig").dsml(a, raw_visible, g.tools);
+         // closed before the think split, so a call ending an unclosed think block is the answer
+diff --git a/zig/src/server/chat_inkling.zig b/zig/src/server/chat_inkling.zig
+new file mode 100644
+index 0000000..bfb3948
+--- /dev/null
++++ b/zig/src/server/chat_inkling.zig
+@@ -0,0 +1,56 @@
++//! Inkling 2's reply blocks (inkling_reply.zig) as reasoning, content and calls, in whole and streamed replies.
++const std = @import("std");
++const json = @import("json");
++const reply_text = @import("reply_text.zig");
++const split = @import("inkling_reply.zig");
++const chat = @import("chat.zig");
++const Value = json.Value;
++
++/// Inkling 2's replies end their sampling with this marker; a tokenizer that holds it speaks the block format.
++pub fn is(text: anytype) bool {
++    return text.vtable.token_id(text.ctx, split.markers.end_sampling) != null and text.vtable.token_id(text.ctx, split.markers.model) != null;
++}
++
++/// The reply so far (ids past the prompt, specials spelled out) split as vLLM's Inkling parser splits it.
++pub fn read(g: anytype, ids: []const u32, finished: bool) std.mem.Allocator.Error!@import("kimi_reply.zig").Result {
++    const raw = try g.srv.text.decode(g.a, ids);
++    const r = split.split(g.a, raw) catch |e| return e;
++    var calls: ?[]Value = null;
++    if (g.tools.len > 0 and r.calls.len > 0) {
++        const list = try g.a.alloc(Value, r.calls.len);
++        for (r.calls, list, 0..) |c, *v, i| {
++            const f = try json.newObject(g.a);
++            try f.put(g.a, "name", .{ .string = c.name });
++            try f.put(g.a, "arguments", .{ .string = c.arguments });
++            const o = try json.newObject(g.a);
++            try o.put(g.a, "id", .{ .string = try std.fmt.allocPrint(g.a, "call_{d}", .{i}) });
++            try o.put(g.a, "type", .{ .string = "function" });
++            try o.put(g.a, "function", .{ .object = f });
++            v.* = .{ .object = o };
++        }
++        calls = list;
++    }
++    return .{
++        .content = g.stops.visible(r.content, !finished),
++        .reasoning = g.stops.visible(r.reasoning, !finished),
++        .calls = calls,
++        .reasoning_tokens = 0,
++    };
++}
++
++/// A streamed reply's new reasoning and content; calls wait for the finished split.
++pub fn stream(g: anytype, sink: chat.Sink) chat.Failure!void {
++    const ids = reply_text.stripTrailing(g.collected.items, g.srv.eos);
++    const r = try read(g, ids, false);
++    const thought = reply_text.pyStrip(r.reasoning);
++    const reason = g.streamed_reasoning.after(thought, false);
++    if (reason.len > 0) {
++        try g.streamed_reasoning.set(g.a, thought, reason);
++        try g.emit(sink, try reply_text.deltaOf(g.a, "reasoning_content", reason));
++    }
++    const delta = g.streamed.after(r.content, false);
++    if (delta.len > 0) {
++        try g.streamed.set(g.a, r.content, delta);
++        try g.emit(sink, .{ .string = delta });
++    }
++}
+diff --git a/zig/src/families/inkling2/reply.zig b/zig/src/server/inkling_reply.zig
+similarity index 100%
+rename from zig/src/families/inkling2/reply.zig
+rename to zig/src/server/inkling_reply.zig
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 1a9e2c8..fc6e47a 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -59,6 +59,7 @@ test {
+     _ = @import("tool_lfm2.zig");
+     _ = @import("tool_lfm2_stream_test.zig");
+     _ = @import("tool_minimax.zig");
++    _ = @import("inkling_reply.zig");
+     _ = @import("tool_stream.zig");
+     _ = @import("tool_params.zig");
+     _ = @import("tool_grammar.zig");

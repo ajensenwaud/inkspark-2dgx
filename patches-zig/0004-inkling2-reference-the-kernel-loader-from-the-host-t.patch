@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:25:46 +1100
+Subject: [PATCH 04/45] inkling2: reference the kernel loader from the host
+ tests
+
+---
+ zig/src/families/inkling2/kernels_test.zig | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index 5531700..b609b5e 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -32,6 +32,11 @@ test "inkling2 kernels: chunks and scratch at the context targets (1M x 1 and 8
+     try t.expectEqual(@as(u32, 131136), k.Layer.global(131073).ring);
+ }
+ 
++test "inkling2 kernels: the loader type-checks in a build with kernels" {
++    _ = &k.Kernels.load;
++    _ = &k.Kernels.unload;
++}
++
+ const Fake = struct {
+     var grids: [4][3]u32 = undefined;
+     var blocks: [4]u32 = undefined;

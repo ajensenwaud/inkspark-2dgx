@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:14:35 +1100
+Subject: [PATCH 36/45] inkling2: a prompt chunk runs the head on its last row
+ only
+
+---
+ zig/src/families/inkling2/engine.zig  | 3 ++-
+ zig/src/families/inkling2/forward.zig | 6 ++++--
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 10c0bb7..aa7d154 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -279,7 +279,8 @@ pub const Engine = struct {
+         if (start == 0) try st.clearSlot(&e.c, e.d, e.slot, e.stream) else if (start != st.pos[e.slot]) return error.BadChunk;
+         e.states.overwrite(e.slot, start); // states on this slot past `start` lose their rows to this pass
+         const end = @min(ids.len, start + prompt_rows);
+-        const f = e.forward(&e.bp, e.shape_p);
++        var f = e.forward(&e.bp, e.shape_p);
++        f.last_logits = true;
+         // a deep call writes partials for every global chunk: fewer rows a call, the same bits a row
+         const most = @max(1, e.bp.parts.slots / (e.shape_p.heads * fw.stride(&e.c, end - 1)));
+         var at = start;
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 037ce7a..396f1ed 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -321,6 +321,7 @@ pub const Forward = struct {
+     exchange: Exchange = .local,
+     tap_at: ?[7]u32 = null, // the layers whose input (the partial block) the drafter's first seven taps read
+     images: ?Images = null, // a prompt call's pictures: its one stream's rows from prompt position `lo`
++    last_logits: bool = false, // the head on the call's last row only (a prompt chunk draws from it alone)
+ 
+     /// The drafter's taps of layer `i`'s input (b.x, the running partial block): copies only, the forward unchanged.
+     fn tap(f: Forward, i: usize, n: usize) !void {
+@@ -511,8 +512,9 @@ pub const Forward = struct {
+         try ops.mix(k, s, fm);
+         if (f.tap_at != null) try f.tapCopy(b.normed, 7, n); // the last tap: the head's input
+         const nv = f.w.share.vocab.len();
+-        try f.dense(f.w.head, b.normed, n, b.logits.ptr, .f32);
+-        try ops.softcap(k, s, b.logits.ptr, n * nv, c.logit_softcap);
++        const hr: usize = if (f.last_logits) n - 1 else 0; // rows before hr keep no logits
++        try f.dense(f.w.head, b.normed + hr * h * 2, n - hr, b.logits.ptr + hr * nv * 4, .f32);
++        try ops.softcap(k, s, b.logits.ptr + hr * nv * 4, (n - hr) * nv, c.logit_softcap);
+     }
+ };
+ 

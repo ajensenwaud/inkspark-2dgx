@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:15:33 +1100
+Subject: [PATCH 21/45] inkling2: price windows, shared forwards and draft
+ passes from GB10 timings
+
+---
+ zig/src/families/inkling2/lanes.zig | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 9d779b5..132963e 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -12,6 +12,18 @@ const be = lanes.backend;
+ const ring = 1024;
+ pub const max_rows = engine.window_rows;
+ 
++/// Forward ms on the inkspark-2dgx pack at TP=2 (tf-inkling2-engine timing, medians of 16): a lone window by rows,
++/// then shared forwards by total rows, taking the dearer split where streams x rows differ (interpolated between).
++const gb10_window_costs = [_]lanes.config.Cost{
++    .{ .width = 1, .ms = 31.8 }, .{ .width = 2, .ms = 38.7 }, .{ .width = 3, .ms = 45.1 }, .{ .width = 4, .ms = 52.0 },
++    .{ .width = 5, .ms = 56.6 }, .{ .width = 6, .ms = 61.0 }, .{ .width = 7, .ms = 66.9 }, .{ .width = 8, .ms = 69.8 },
++};
++const gb10_shared_costs = [_]lanes.config.Cost{
++    .{ .width = 1, .ms = 31.8 },   .{ .width = 2, .ms = 41.3 },   .{ .width = 4, .ms = 61.8 },
++    .{ .width = 8, .ms = 81.4 },   .{ .width = 16, .ms = 120.6 }, .{ .width = 32, .ms = 182.3 },
++    .{ .width = 64, .ms = 223.4 },
++};
++
+ /// A stream's place in the backend: its slot, the rows its last window left uncommitted, its first token.
+ const Lane = struct {
+     slot: u32,
+@@ -68,7 +80,12 @@ pub const Lanes = struct {
+             .speculate_early = false,
+             .drafts = if (head) max_held else 0,
+             .draft_streams = head,
+-            .mtp_step_ms = if (head) 2.0 else 0, // a block's 7 drafts in one pass (estimate; not timed on the full pack)
++            .mtp_step_ms = if (head) 16.4 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (16.4 ms timed)
++            .draft_step_ms = if (head) 15.8 else 0, // each further stream's block runs as its own pass (timed)
++            .plain_guard = head, // plain rounds compete: one-row forwards are cheap next to a draft pass
++            .window_costs = if (head) &gb10_window_costs else &.{},
++            .window_costs_lone = true,
++            .shared_costs = if (head) &gb10_shared_costs else &.{},
+             .hidden_rows = true,
+             .batch_rows = engine.shared_rows,
+             .max_streams = engine.max_shared,

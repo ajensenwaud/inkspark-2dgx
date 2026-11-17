@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 11:55:06 +1100
+Subject: [PATCH 34/45] inkling2: TF_INKLING2_DRAFT_WEIGHTS=nvfp4 quantises the
+ drafter's projections at load
+
+The bundled DSpark drafter is released in bf16 and its five layers'
+projections are most of a draft pass's bytes. NVFP4 by round to
+nearest (ModelOpt's layout, one global scale a matrix) through the
+lane matmul's existing fp4 mode. The target checks every draft, so it
+moves acceptance, never output. bf16 stays the default until measured.
+---
+ docs/environment.md                        |  1 +
+ zig/src/families/inkling2/dspark.zig       | 18 ++++-
+ zig/src/families/inkling2/dspark_quant.zig | 90 ++++++++++++++++++++++
+ zig/src/families/inkling2/inkling2.zig     |  1 +
+ zig/src/platform/environment.zig           |  1 +
+ zig/src/platform/environment_test.zig      |  1 +
+ 6 files changed, 111 insertions(+), 1 deletion(-)
+ create mode 100644 zig/src/families/inkling2/dspark_quant.zig
+
+diff --git a/docs/environment.md b/docs/environment.md
+index 2c6a5fb..eba6fb5 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -43,6 +43,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_INKLING2_RANK` | Inkling 2 on CUDA: this rank, a whole number below `TF_INKLING2_WORLD`; set both or neither |
+ | `TF_INKLING2_WORLD` | Inkling 2 on CUDA: whole rank count from 1; the family admits exactly 2 |
+ | `TF_INKLING2_PROFILE` | Inkling 2 on CUDA: `1` times a round's phases on each rank and logs a line every 200 rounds (syncs the forward; off by default) |
++| `TF_INKLING2_DRAFT_WEIGHTS` | Inkling 2 on CUDA: `nvfp4` quantises the bundled drafter's projections to NVFP4 at load (round to nearest); `bf16` (default) keeps them as released. Changes acceptance, never output |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_FLASHNEXT_SCALE_INDEX` | Flash Next on Metal before tensor units: exactly `0` or `1`; `1` has the 4-bit expert kernels read each group's scale and bias through a 16-bit index into its tensor's table of pairs, the same values with fewer weight bytes; default 0 |
+diff --git a/zig/src/families/inkling2/dspark.zig b/zig/src/families/inkling2/dspark.zig
+index 26ab4cb..3451c3d 100644
+--- a/zig/src/families/inkling2/dspark.zig
++++ b/zig/src/families/inkling2/dspark.zig
+@@ -4,6 +4,7 @@ const cuda = @import("cuda");
+ const core = @import("core");
+ const cfg = @import("config.zig");
+ const weights = @import("weights.zig");
++const quant = @import("dspark_quant.zig");
+ 
+ /// The drafter's file beside the pack's shards (the release ships it at the checkpoint's top level).
+ pub const file = "mtp.safetensors";
+@@ -141,6 +142,7 @@ const Loader = struct {
+     d: *const cuda.Driver,
+     w: *Weights,
+     ck: *core.Checkpoint,
++    fp4: bool = false, // TF_INKLING2_DRAFT_WEIGHTS=nvfp4: the projections quantised at load (dspark_quant.zig)
+     buf: [160]u8 = undefined,
+ 
+     fn get(L: *Loader, comptime fmt: []const u8, args: anytype, dims: []const usize) !core.checkpoint.Tensor {
+@@ -184,6 +186,18 @@ const Loader = struct {
+     }
+ 
+     fn pack(L: *Loader, host: []const u16, n: usize, k: usize) !cuda.qmmf.Weight {
++        if (L.fp4) {
++            var q = try quant.quantise(L.gpa, host, n, k);
++            defer q.deinit(L.gpa);
++            const words = try L.gpa.alloc(u32, cuda.nvfp4.padded(n) / 64 * (k / cuda.nvfp4.group) * 512);
++            defer L.gpa.free(words);
++            const tiles = try L.gpa.alloc(u8, cuda.nvfp4.padded(n) * (k / 16));
++            defer L.gpa.free(tiles);
++            cuda.nvfp4.packWords(words, q.codes, n, k);
++            cuda.nvfp4.packScales(tiles, q.scales, n, k);
++            const wp = try L.w.put(L.gpa, L.d, std.mem.sliceAsBytes(words));
++            return cuda.nvfp4.weight(wp, try L.w.put(L.gpa, L.d, tiles), q.global, n, k);
++        }
+         const npad = (n + 127) / 128 * 128;
+         const tiles = try L.gpa.alloc(u16, npad * k);
+         defer L.gpa.free(tiles);
+@@ -201,7 +215,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []co
+     try ck.add(dir, file);
+     var w: Weights = .{ .c = c };
+     errdefer w.deinit(gpa);
+-    var L: Loader = .{ .gpa = gpa, .d = d, .w = &w, .ck = &ck };
++    const fp4 = try @import("sys").environment.read(u64, "TF_INKLING2_DRAFT_WEIGHTS", 0) == 1;
++    if (fp4) std.log.info("inkling2 drafter: projections as NVFP4 (TF_INKLING2_DRAFT_WEIGHTS)", .{});
++    var L: Loader = .{ .gpa = gpa, .d = d, .w = &w, .ck = &ck, .fp4 = fp4 };
+     const h: usize = tc.hidden;
+     const s = t.share;
+     const D = 128;
+diff --git a/zig/src/families/inkling2/dspark_quant.zig b/zig/src/families/inkling2/dspark_quant.zig
+new file mode 100644
+index 0000000..155cd94
+--- /dev/null
++++ b/zig/src/families/inkling2/dspark_quant.zig
+@@ -0,0 +1,90 @@
++//! The drafter's bf16 projections as NVFP4 at load (TF_INKLING2_DRAFT_WEIGHTS=nvfp4): changes acceptance, never output.
++const std = @import("std");
++const core = @import("core");
++
++const fp8 = core.quant.fp8;
++const fp4 = core.quant.nvfp4;
++
++pub const Quantised = struct {
++    codes: []u8, // [n, k/2], even inputs in the low nibble
++    scales: []u8, // e4m3 [n, k/16]
++    global: f32,
++
++    pub fn deinit(q: *Quantised, gpa: std.mem.Allocator) void {
++        gpa.free(q.codes);
++        gpa.free(q.scales);
++    }
++};
++
++/// The e4m3 byte of a value toE4m3 already rounded (0 <= x <= 448).
++fn e4m3Byte(x: f64) u8 {
++    if (x == 0) return 0;
++    if (x < 1.0 / 64.0) return @intFromFloat(@round(x * 512)); // subnormals: steps of 2^-9
++    const e = std.math.floor(std.math.log2(x));
++    const m: u8 = @intFromFloat(@round((x / std.math.pow(f64, 2, e) - 1) * 8));
++    return @as(u8, @intFromFloat(e + 7)) << 3 | m;
++}
++
++/// The nearest e2m1 nibble to x (ties to the even code), saturating at +-6.
++fn e2m1Code(x: f32) u8 {
++    const mags = [8]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6 };
++    const a = @abs(x);
++    var best: u8 = 0;
++    for (mags, 0..) |m, i| {
++        const d = @abs(a - m);
++        const b = @abs(a - mags[best]);
++        if (d < b or (d == b and i % 2 == 0)) best = @intCast(i);
++    }
++    return if (x < 0 and best != 0) best | 8 else best;
++}
++
++fn bf(v: u16) f32 {
++    return @bitCast(@as(u32, v) << 16);
++}
++
++/// bf16 [n, k] (k a multiple of 16) as NVFP4: global = amax / (6 x 448), each block's scale its amax / 6 / global.
++pub fn quantise(gpa: std.mem.Allocator, w: []const u16, n: usize, k: usize) !Quantised {
++    std.debug.assert(w.len == n * k and k % 16 == 0);
++    var amax: f32 = 0;
++    for (w) |v| amax = @max(amax, @abs(bf(v)));
++    const global: f32 = if (amax > 0) amax / (6.0 * 448.0) else 1.0;
++    const codes = try gpa.alloc(u8, n * k / 2);
++    errdefer gpa.free(codes);
++    const scales = try gpa.alloc(u8, n * k / 16);
++    for (0..n * k / 16) |b| {
++        const blk = w[b * 16 ..][0..16];
++        var bmax: f32 = 0;
++        for (blk) |v| bmax = @max(bmax, @abs(bf(v)));
++        const s = fp8.toE4m3(bmax / 6.0 / global);
++        scales[b] = e4m3Byte(s);
++        const step: f32 = @floatCast(fp8.e4m3(scales[b]) * global);
++        for (0..8) |p| {
++            const lo = if (step > 0) e2m1Code(bf(blk[2 * p]) / step) else 0;
++            const hi = if (step > 0) e2m1Code(bf(blk[2 * p + 1]) / step) else 0;
++            codes[b * 8 + p] = lo | hi << 4;
++        }
++    }
++    return .{ .codes = codes, .scales = scales, .global = global };
++}
++
++test "dspark_quant: e4m3 bytes round-trip, e2m1 rounds to nearest, a matrix decodes within half a step" {
++    for (0..0x7f) |b| try std.testing.expectEqual(@as(u8, @intCast(b)), e4m3Byte(fp8.e4m3(@intCast(b))));
++    try std.testing.expectEqual(@as(u8, 0x6), e2m1Code(4.4)); // 4
++    try std.testing.expectEqual(@as(u8, 0x7), e2m1Code(5.1)); // 6
++    try std.testing.expectEqual(@as(u8, 0xb), e2m1Code(-1.4)); // -1.5
++    try std.testing.expectEqual(@as(u8, 0x7), e2m1Code(9.0)); // saturates at 6
++    const n = 3;
++    const k = 64;
++    var w: [n * k]u16 = undefined;
++    var rng = std.Random.DefaultPrng.init(7);
++    for (&w) |*v| v.* = @truncate(@as(u32, @bitCast(rng.random().floatNorm(f32) * 0.02)) >> 16);
++    var q = try quantise(std.testing.allocator, &w, n, k);
++    defer q.deinit(std.testing.allocator);
++    for (0..n * k) |i| {
++        const s = fp8.e4m3(q.scales[i / 16]) * q.global;
++        const nib = (q.codes[i / 2] >> @intCast(4 * (i % 2))) & 0xF;
++        const back = fp4.e2m1(nib) * s;
++        // the widest e2m1 gap is 2 (4 to 6): within one step of the block scale, and a block's largest is kept close
++        try std.testing.expect(@abs(back - bf(w[i])) <= s + 1e-9);
++    }
++}
+diff --git a/zig/src/families/inkling2/inkling2.zig b/zig/src/families/inkling2/inkling2.zig
+index 0bda2ce..959fdb3 100644
+--- a/zig/src/families/inkling2/inkling2.zig
++++ b/zig/src/families/inkling2/inkling2.zig
+@@ -50,4 +50,5 @@ test {
+     _ = dspark_ops;
+     _ = dspark_run;
+     _ = @import("profile.zig");
++    _ = @import("dspark_quant.zig");
+ }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index a283cd2..ddf5af7 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -158,6 +158,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_RANK", .scope = .cuda, .kind = .u32, .forms = "a whole rank number, below TF_INKLING2_WORLD" },
+     .{ .name = "TF_INKLING2_WORLD", .scope = .cuda, .kind = .u32, .min = 1, .forms = "a whole rank count from 1 (Inkling 2 admits 2)" },
+     .{ .name = "TF_INKLING2_PROFILE", .scope = .cuda, .kind = .flag, .forms = "0 or 1" },
++    .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .scope = .cuda, .kind = .word, .trim = " ", .words = &.{ "bf16", "nvfp4" }, .forms = "bf16 or nvfp4" },
+ };
+ 
+ pub fn rule(name: []const u8) Rule {
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index ae9d840..3fc77a2 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -100,6 +100,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_RANK", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_WORLD", .raw = "2", .n = 2 },
+     .{ .name = "TF_INKLING2_PROFILE", .raw = "1", .n = 1 },
++    .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .raw = "nvfp4", .n = 1 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {

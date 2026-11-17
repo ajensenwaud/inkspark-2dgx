@@ -1,0 +1,625 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 10:47:19 +1100
+Subject: [PATCH 43/45] inkling2: fp8 KV cache for the global layers behind
+ TF_INKLING2_KV
+
+Keys and values of the global layers can be stored as e4m3 with an fp32
+scale a token and key head, dequantised to bf16 at tile load. Sliding
+layers stay bf16, and bf16 stays the default.
+---
+ docs/environment.md                        |   1 +
+ zig/kernels/cuda/inkling2/attention.cu     | 157 +++++++++++++++++++--
+ zig/src/families/inkling2/dump_main.zig    |   2 +-
+ zig/src/families/inkling2/engine.zig       |   5 +-
+ zig/src/families/inkling2/forward.zig      |  37 ++++-
+ zig/src/families/inkling2/kernels.zig      |  43 ++++--
+ zig/src/families/inkling2/kernels_test.zig |  52 +++++--
+ zig/src/platform/environment.zig           |   1 +
+ zig/src/platform/environment_test.zig      |   1 +
+ 9 files changed, 257 insertions(+), 42 deletions(-)
+
+diff --git a/docs/environment.md b/docs/environment.md
+index eba6fb5..65bfdb4 100644
+--- a/docs/environment.md
++++ b/docs/environment.md
+@@ -44,6 +44,7 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
+ | `TF_INKLING2_WORLD` | Inkling 2 on CUDA: whole rank count from 1; the family admits exactly 2 |
+ | `TF_INKLING2_PROFILE` | Inkling 2 on CUDA: `1` times a round's phases on each rank and logs a line every 200 rounds (syncs the forward; off by default) |
+ | `TF_INKLING2_DRAFT_WEIGHTS` | Inkling 2 on CUDA: `nvfp4` quantises the bundled drafter's projections to NVFP4 at load (round to nearest); `bf16` (default) keeps them as released. Changes acceptance, never output |
++| `TF_INKLING2_KV` | Inkling 2 on CUDA: `fp8` stores the global layers' keys and values as e4m3 with an fp32 scale a token and key head (about half the bytes and memory of a stream); `bf16` (default) keeps them in bf16. Sliding layers stay bf16 |
+ | `TF_PROMPT_ROWS` | Native serving: a multiple of 16 from 128 through 2048; unset keeps the chip/family default |
+ | `TF_ANE_COLUMNS` | Whole u32 count; zero disables the experimental share; default zero |
+ | `TF_FLASHNEXT_SCALE_INDEX` | Flash Next on Metal before tensor units: exactly `0` or `1`; `1` has the 4-bit expert kernels read each group's scale and bias through a 16-bit index into its tensor's table of pairs, the same values with fewer weight bytes; default 0 |
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index 360a6b1..162b44e 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -1,6 +1,7 @@
+ // Inkling 2 attention: q/k/v/rel preparation, the relative-bias table, chunked tensor-core attention and the merge.
+ #include <cstdint>
+ #include <cuda_bf16.h>
++#include <cuda_fp8.h>
+ 
+ namespace ink2 {
+ 
+@@ -47,20 +48,92 @@ __device__ __forceinline__ void clip(float* x, float thr) {
+     for (int i = 0; i < 4; ++i) x[i] *= f;
+ }
+ 
+-}  // namespace ink2
++// FP8 global caches (TF_INKLING2_KV=fp8): e4m3 [slot][kv_head][128] a stream, an fp32 scale (amax / 448) a slot+head.
+ 
+-using ink2::Seg;
++// Two e4m3 codes (the low bytes of v) as an exact bf16x2 pair: exponent rebiased by one bf16x2 multiply by 2^120.
++__device__ __forceinline__ uint32_t e4m3x2(uint32_t v) {
++    const uint32_t t = ((v & 0x7Fu) << 4) | ((v & 0x80u) << 8) | ((v & 0x7F00u) << 12) | ((v & 0x8000u) << 16);
++    uint32_t r;
++    asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
++    return r;
++}
++
++// Four codes times the row's scale, rounded once to bf16 (fp32 products).
++__device__ __forceinline__ uint2 deq4(uint32_t w, float s) {
++    uint2 o;
++    const uint32_t a = e4m3x2(w), b = e4m3x2(w >> 16);
++    const float a1 = __uint_as_float(a & 0xFFFF0000u) * s, a0 = __uint_as_float(a << 16) * s;
++    const float b1 = __uint_as_float(b & 0xFFFF0000u) * s, b0 = __uint_as_float(b << 16) * s;
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(o.x) : "f"(a1), "f"(a0));
++    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(o.y) : "f"(b1), "f"(b0));
++    return o;
++}
++
++// A 64-key fp8 tile in registers, 128 threads x 4 pieces of 16 codes (key e >> 3, columns (e & 7) * 16).
++struct Raw8 {
++    uint4 b[4];
++    float s[4];
++};
++
++// Keys kt..kt+63 of key head kvh of an fp8 cache (a stream's bytes at `off`) into registers; zero outside k_lo..k_hi.
++__device__ __forceinline__ void fetch8(Raw8& r, const uint8_t* __restrict__ c, const float* __restrict__ sc,
++                                       long long off, int kv_heads, int ring, int kvh, int kt, int k_lo, int k_hi) {
++    for (int i = 0; i < 4; ++i) {
++        const int e = threadIdx.x + 128 * i, kp = kt + (e >> 3);
++        r.b[i] = make_uint4(0, 0, 0, 0);
++        r.s[i] = 0.0f;
++        if (kp >= k_lo && kp <= k_hi) {
++            const size_t row = static_cast<size_t>(kp % ring) * kv_heads + kvh;
++            r.b[i] = *reinterpret_cast<const uint4*>(c + off + row * kDim + (e & 7) * 16);
++            r.s[i] = sc[off / kDim + row];
++        }
++    }
++}
++
++// The fetched tile as bf16 rows [64][kPad] in shared memory (zeros stay zeros: masked p = 0 never meets garbage).
++__device__ __forceinline__ void store8(const Raw8& r, uint16_t* dst) {
++    for (int i = 0; i < 4; ++i) {
++        const int e = threadIdx.x + 128 * i;
++        uint4* d = reinterpret_cast<uint4*>(dst + (e >> 3) * kPad + (e & 7) * 16);
++        const uint2 a = deq4(r.b[i].x, r.s[i]), b = deq4(r.b[i].y, r.s[i]);
++        const uint2 c = deq4(r.b[i].z, r.s[i]), e2 = deq4(r.b[i].w, r.s[i]);
++        d[0] = make_uint4(a.x, a.y, b.x, b.y);
++        d[1] = make_uint4(c.x, c.y, e2.x, e2.y);
++    }
++}
++
++// One tensor's (K or V) 64-key fp8 tile to bf16 shared rows, for blocks of 128 threads: the one dequantise path.
++__device__ __forceinline__ void tile8(const uint8_t* __restrict__ c, const float* __restrict__ sc, long long off,
++                                      int kv_heads, int ring, int kvh, int kt, int k_lo, int k_hi, uint16_t* dst) {
++    Raw8 r;
++    fetch8(r, c, sc, off, kv_heads, ring, kvh, kt, k_lo, k_hi);
++    store8(r, dst);
++}
++
++// One token-head row (4 values a lane) to e4m3 at `dst` with its scale (lane 0); a zero row stores zeros.
++__device__ __forceinline__ void put8(const float* x, uint8_t* dst, float* scale, int lane) {
++    float amax = fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3])));
++    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++    const float inv = amax > 0.0f ? __fdiv_rn(448.0f, amax) : 0.0f;
++    uint32_t w = 0;
++    for (int i = 0; i < 4; ++i)
++        w |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(__fmul_rn(x[i], inv), __NV_SATFINITE, __NV_E4M3)) << (8 * i);
++    *reinterpret_cast<uint32_t*>(dst + lane * 4) = w;
++    if (lane == 0) *scale = amax > 0.0f ? __fdiv_rn(amax, 448.0f) : 0.0f;
++}
+ 
+ // Per row and head: q = clip(q * q_scale) (* tau), rel = clip(rel * rel_scale) (* tau), k = clip(k), v = rms(v).
+-extern "C" __global__ void tf_ink2_prep(const uint16_t* __restrict__ q_raw, const uint16_t* __restrict__ k_raw,
++template <bool KV8>
++__device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, const uint16_t* __restrict__ k_raw,
+                                         const uint16_t* __restrict__ v_raw, const uint16_t* __restrict__ rel_raw,
+                                         const uint16_t* __restrict__ q_scale, const uint16_t* __restrict__ rel_scale,
+                                         const int* __restrict__ rpos, const int* __restrict__ rseg,
+                                         const Seg* __restrict__ segs, uint16_t* __restrict__ q_out,
+                                         uint16_t* __restrict__ rel_out, uint16_t* __restrict__ kc,
+                                         uint16_t* __restrict__ vc, int heads, int kv_heads, int ring, int global,
+-                                        float qk_clip, float rel_clip, float floor_pos, float alpha, float eps) {
+-    using namespace ink2;
++                                        float qk_clip, float rel_clip, float floor_pos, float alpha, float eps,
++                                        float* __restrict__ ksc, float* __restrict__ vsc) {
++
+     const int row = blockIdx.x, y = blockIdx.y, lane = threadIdx.x;
+     const int pos = rpos[row];
+     const float tau = global ? 1.0f + alpha * logf(fmaxf(static_cast<float>(pos + 1) / floor_pos, 1.0f)) : 1.0f;
+@@ -93,10 +166,41 @@ extern "C" __global__ void tf_ink2_prep(const uint16_t* __restrict__ q_raw, cons
+         for (int i = 0; i < 4; ++i) x[i] *= r;
+     }
+     const Seg s = segs[rseg[row]];
++    if (KV8) {  // the bf16 value, as the bf16 cache would hold it, to e4m3
++        for (int i = 0; i < 4; ++i) x[i] = bf(tobf(x[i]));
++        const size_t at = static_cast<size_t>(pos % ring) * kv_heads + h;
++        put8(x, reinterpret_cast<uint8_t*>(key ? kc : vc) + s.off + at * kDim, (key ? ksc : vsc) + s.off / kDim + at,
++             lane);
++        return;
++    }
+     uint16_t* dst = (key ? kc : vc) + s.off + (static_cast<size_t>(h) * ring + pos % ring) * kDim;
+     for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = tobf(x[i]);
+ }
+ 
++}  // namespace ink2
++
++using ink2::Seg;
++
++#define TF_INK2_PREP_ARGS                                                                                          \
++    const uint16_t *__restrict__ q_raw, const uint16_t *__restrict__ k_raw, const uint16_t *__restrict__ v_raw,    \
++        const uint16_t *__restrict__ rel_raw, const uint16_t *__restrict__ q_scale,                                \
++        const uint16_t *__restrict__ rel_scale, const int *__restrict__ rpos, const int *__restrict__ rseg,        \
++        const Seg *__restrict__ segs, uint16_t *__restrict__ q_out, uint16_t *__restrict__ rel_out,                \
++        uint16_t *__restrict__ kc, uint16_t *__restrict__ vc, int heads, int kv_heads, int ring, int global,       \
++        float qk_clip, float rel_clip, float floor_pos, float alpha, float eps
++#define TF_INK2_PREP_PASS                                                                                          \
++    q_raw, k_raw, v_raw, rel_raw, q_scale, rel_scale, rpos, rseg, segs, q_out, rel_out, kc, vc, heads, kv_heads,   \
++        ring, global, qk_clip, rel_clip, floor_pos, alpha, eps
++
++extern "C" __global__ void tf_ink2_prep(TF_INK2_PREP_ARGS) {
++    ink2::prepRow<false>(TF_INK2_PREP_PASS, nullptr, nullptr);
++}
++
++// The same for a global layer whose caches are fp8: k and v stored as e4m3 rows plus their scales.
++extern "C" __global__ void tf_ink2_prep8(TF_INK2_PREP_ARGS, float* __restrict__ ksc, float* __restrict__ vsc) {
++    ink2::prepRow<true>(TF_INK2_PREP_PASS, ksc, vsc);
++}
++
+ // tab[row, head, d] = bf16(rel[row, head, :] . proj[:, d]) for d < 1024, fp32 sums in tap order (rel_logits_proj).
+ extern "C" __global__ void tf_ink2_rel_table(const uint16_t* __restrict__ rel, const uint16_t* __restrict__ proj,
+                                              uint16_t* __restrict__ tab) {
+@@ -130,13 +234,15 @@ __device__ __forceinline__ float scaled(float o, float a, float p, float b) {
+ }
+ 
+ // 64 (row, head) pairs of a key head over a block's keys (FOLD: a global chunk, split: a sub-chunk, else a chunk).
+-template <bool FOLD>
++template <bool FOLD, bool KV8 = false>
+ __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
+                                          const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab,
+                                          const Seg* __restrict__ segs, const int2* __restrict__ tiles,
+                                          float* __restrict__ part_o, float2* __restrict__ part_ml, int heads,
+                                          int kv_heads, int ring, int window, int chunk, int c0, int chunks,
+-                                         float scale, int split, uint16_t* ks, uint16_t* vs) {
++                                         float scale, int split, uint16_t* ks, uint16_t* vs,
++                                         const float* __restrict__ ksc = nullptr,
++                                         const float* __restrict__ vsc = nullptr) {
+     const int2 tile = tiles[blockIdx.x];
+     const Seg s = segs[tile.x];
+     const int group = heads / kv_heads;
+@@ -195,7 +301,14 @@ __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const u
+         for (int kt = k_lo & ~(kKeys - 1); kt <= k_hi; kt += kKeys) {
+             __syncthreads();
+             const size_t slot0 = static_cast<size_t>(kt % ring);
+-            for (int e = threadIdx.x; e < kKeys * (kDim / 8); e += 128) {
++            if (KV8) {  // both tensors' loads in flight before either is converted (tile8's halves)
++                Raw8 rk, rv;
++                fetch8(rk, reinterpret_cast<const uint8_t*>(kc), ksc, s.off, kv_heads, ring, kvh, kt, k_lo, k_hi);
++                fetch8(rv, reinterpret_cast<const uint8_t*>(vc), vsc, s.off, kv_heads, ring, kvh, kt, k_lo, k_hi);
++                store8(rk, ks);
++                store8(rv, vs);
++            }
++            for (int e = threadIdx.x; !KV8 && e < kKeys * (kDim / 8); e += 128) {
+                 const int key = e >> 4, col = (e & 15) * 8;
+                 const int kp = kt + key;
+                 uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
+@@ -314,6 +427,20 @@ extern "C" __global__ void __launch_bounds__(128)
+                     scale, split, ks, vs);
+ }
+ 
++// Split global calls on fp8 caches (TF_INKLING2_KV=fp8): tiles dequantised to bf16 at load, the rest as tf_ink2_attn.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_attn8(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
++                  const uint16_t* __restrict__ tab, const Seg* __restrict__ segs, const int2* __restrict__ tiles,
++                  float* __restrict__ part_o, float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
++                  int window, int chunk, int c0, int chunks, float scale, int split, const float* __restrict__ ksc,
++                  const float* __restrict__ vsc) {
++    using namespace ink2;
++    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
++    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
++    attnTile<false, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk, c0,
++                          chunks, scale, split, ks, vs, ksc, vsc);
++}
++
+ // Global layers a chunk a block, its sub-chunks folded in order (prompt calls: no partial a sub-chunk).
+ extern "C" __global__ void __launch_bounds__(128)
+     tf_ink2_attn_fold(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
+@@ -327,6 +454,20 @@ extern "C" __global__ void __launch_bounds__(128)
+                    0, ks, vs);
+ }
+ 
++// The fold path on fp8 caches.
++extern "C" __global__ void __launch_bounds__(128)
++    tf_ink2_attn_fold8(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
++                       const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab, const Seg* __restrict__ segs,
++                       const int2* __restrict__ tiles, float* __restrict__ part_o, float2* __restrict__ part_ml,
++                       int heads, int kv_heads, int ring, int chunk, int c0, int chunks, float scale,
++                       const float* __restrict__ ksc, const float* __restrict__ vsc) {
++    using namespace ink2;
++    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
++    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
++    attnTile<true, true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, 0, chunk, c0, chunks,
++                         scale, 0, ks, vs, ksc, vsc);
++}
++
+ // Per (row, head): its chunks folded in order (subs > 1: each from its sub-chunks first), the sink, then the gate.
+ extern "C" __global__ void tf_ink2_merge(const float* __restrict__ part_o, const float2* __restrict__ part_ml,
+                                          const uint16_t* __restrict__ sink, const uint16_t* __restrict__ gate,
+diff --git a/zig/src/families/inkling2/dump_main.zig b/zig/src/families/inkling2/dump_main.zig
+index e37b191..ad701f5 100644
+--- a/zig/src/families/inkling2/dump_main.zig
++++ b/zig/src/families/inkling2/dump_main.zig
+@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init) !u8 {
+     var w = try ink.weights.load(gpa, io, &driver, &m.dense, stream, args[1], c, place.rank, place.world);
+     defer w.deinit();
+     std.debug.print("rank {d}/{d}: loaded {d} layers, {d:.2} GiB in {d:.1} s, vocab [{d}, {d})\n", .{ place.rank, place.world, c.layers, gib(w.bytes), secs(io, t0), w.share.vocab.lo, w.share.vocab.hi });
+-    const shape: ink.forward.Shape = .{ .rows = @max(@min(chunk, longest), total), .context = std.mem.alignForward(usize, longest + 1, 64), .heads = w.share.heads.len(), .kv = w.share.kv.len() };
++    const shape: ink.forward.Shape = .{ .rows = @max(@min(chunk, longest), total), .context = std.mem.alignForward(usize, longest + 1, 64), .heads = w.share.heads.len(), .kv = w.share.kv.len(), .kv8 = try ink.forward.kvSetting() };
+     var b = try ink.forward.Buffers.init(gpa, &driver, &w, shape, null);
+     defer b.deinit();
+     var st = try ink.forward.State.init(gpa, &driver, &w.config, shape, texts.len);
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index da65a74..a6e89af 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -99,8 +99,9 @@ pub const Engine = struct {
+         errdefer e.w.deinit();
+         const heads = e.w.share.heads.len();
+         const kv = e.w.share.kv.len();
+-        e.shape_p = .{ .rows = prompt_rows, .context = o.capacity, .heads = heads, .kv = kv };
+-        e.shape_d = .{ .rows = shared_rows, .context = o.capacity, .heads = heads, .kv = kv, .ring_rows = prompt_rows, .hist = true };
++        const kv8 = try fw.kvSetting();
++        e.shape_p = .{ .rows = prompt_rows, .context = o.capacity, .heads = heads, .kv = kv, .kv8 = kv8 };
++        e.shape_d = .{ .rows = shared_rows, .context = o.capacity, .heads = heads, .kv = kv, .ring_rows = prompt_rows, .hist = true, .kv8 = kv8 };
+         errdefer for (e.parts.items) |*b| b.free();
+         const slots = @max(prompt_rows * heads * prompt_parts, shared_rows * heads * fw.stride(&e.c, o.capacity - 1));
+         const shared = try fw.partialsFor(d, &e.parts, gpa, slots);
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 149fa47..28c0c25 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -75,13 +75,14 @@ pub const Shape = struct {
+     kv: usize, // the rank's key heads
+     ring_rows: usize = 0, // rows a call may write into a sliding ring (0: rows)
+     hist: bool = false, // the calls keep each row's conv inputs (Buffers.hist), so a short keep needs no forward
++    kv8: bool = false, // global layers' caches in fp8 (TF_INKLING2_KV=fp8, kvSetting)
+ 
+     pub fn sliding(s: Shape, c: *const cfg.Config) kernels.Layer {
+         return kernels.Layer.sliding(c.window, @intCast(if (s.ring_rows > 0) s.ring_rows else s.rows));
+     }
+ 
+     pub fn global(s: Shape) kernels.Layer {
+-        return kernels.Layer.global(@intCast(s.context));
++        return kernels.Layer.global(@intCast(s.context), s.kv8);
+     }
+ 
+     fn layer(s: Shape, c: *const cfg.Config, i: usize) kernels.Layer {
+@@ -95,11 +96,20 @@ pub fn stride(c: *const cfg.Config, last_pos: usize) u32 {
+     return @max(kernels.slotsFor(sl, 1), kernels.chunks(last_pos, kernels.global_chunk));
+ }
+ 
++/// Whether the global layers' caches are fp8 (TF_INKLING2_KV=fp8; bf16 by default), read once at engine start.
++pub fn kvSetting() !bool {
++    const env = @import("sys").environment;
++    comptime env.registered("TF_INKLING2_KV");
++    const fp8 = try env.read(u64, "TF_INKLING2_KV", 0) == 1;
++    if (fp8) std.log.info("inkling2: global layers' KV cache in fp8 e4m3 (TF_INKLING2_KV)", .{});
++    return fp8;
++}
++
+ /// Bytes of one cache slot of a stream: K and V rings a layer plus four conv states (the per-stream cost).
+ pub fn slotBytes(c: *const cfg.Config, s: Shape) u64 {
+     var total: u64 = 0;
+     for (0..c.layers) |i| {
+-        total += 2 * @as(u64, s.kv) * s.layer(c, i).ring * c.head_dim * 2;
++        total += 2 * @as(u64, s.layer(c, i).cacheBytes(s.kv));
+         total += 2 * 3 * @as(u64, s.kv) * c.head_dim * 4 + 2 * 3 * @as(u64, c.hidden) * 4;
+     }
+     return total;
+@@ -119,6 +129,8 @@ pub const State = struct {
+     bufs: std.ArrayList(Buf) = .empty,
+     kc: []u64 = &.{},
+     vc: []u64 = &.{},
++    ks: []u64 = &.{}, // fp8 global layers: each K row's scale, [slots][ring][kv] fp32 after the rows (else 0)
++    vs: []u64 = &.{},
+     conv: [][4]u64 = &.{}, // k, v (fp32 [slots][3][kv * 128]) and attention, MLP (fp32 [slots][3][hidden]) a layer
+     pos: []usize = &.{}, // positions each slot's caches hold
+     ring: [2]usize = .{ 0, 0 }, // sliding and global ring slots a key head
+@@ -129,20 +141,29 @@ pub const State = struct {
+         errdefer st.deinit();
+         st.kc = try gpa.alloc(u64, c.layers);
+         st.vc = try gpa.alloc(u64, c.layers);
++        st.ks = try gpa.alloc(u64, c.layers);
++        st.vs = try gpa.alloc(u64, c.layers);
+         st.conv = try gpa.alloc([4]u64, c.layers);
+         st.pos = try gpa.alloc(usize, slots);
+         @memset(st.pos, 0);
+         st.ring = .{ s.sliding(c).ring, s.global().ring };
+         for (0..c.layers) |i| {
+-            const ring: usize = s.layer(c, i).ring;
+-            st.kc[i] = try alloc(d, &st.bufs, gpa, slots * s.kv * ring * c.head_dim * 2);
+-            st.vc[i] = try alloc(d, &st.bufs, gpa, slots * s.kv * ring * c.head_dim * 2);
++            const l = s.layer(c, i);
++            const rows = slots * (l.cacheBytes(s.kv) - l.scaleBytes(s.kv));
++            st.kc[i] = try alloc(d, &st.bufs, gpa, slots * l.cacheBytes(s.kv));
++            st.vc[i] = try alloc(d, &st.bufs, gpa, slots * l.cacheBytes(s.kv));
++            st.ks[i] = if (l.kv8) st.kc[i] + rows else 0;
++            st.vs[i] = if (l.kv8) st.vc[i] + rows else 0;
+             for (0..2) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * s.kv * c.head_dim * 4);
+             for (2..4) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * @as(usize, c.hidden) * 4);
+         }
+         return st;
+     }
+ 
++    pub fn cache(st: *const State, i: usize) kernels.Cache {
++        return .{ .k = st.kc[i], .v = st.vc[i], .ks = st.ks[i], .vs = st.vs[i] };
++    }
++
+     /// Back to empty streams: caches and conv states zeroed.
+     pub fn reset(st: *State) !void {
+         for (st.bufs.items) |b| try b.fill8(0, null);
+@@ -164,6 +185,8 @@ pub const State = struct {
+         st.bufs.deinit(st.gpa);
+         st.gpa.free(st.kc);
+         st.gpa.free(st.vc);
++        st.gpa.free(st.ks);
++        st.gpa.free(st.vs);
+         st.gpa.free(st.conv);
+         st.gpa.free(st.pos);
+     }
+@@ -486,9 +509,9 @@ pub const Forward = struct {
+             lay_i.ring = @intCast(st.ring[@intFromBool(global)]); // the caches' rings, whatever rows this call's scratch holds
+             const rows = rows_by[@intFromBool(global)];
+             const prep: kernels.Prep = .{ .qk_clip = c.qk_clip, .rel_clip = c.rel_clip, .floor = c.log_floor, .alpha = c.log_alpha, .eps = c.eps };
+-            try kernels.prep(&f.m.attn, s, rows, lay_i, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.kc[i], st.vc[i]);
++            try kernels.prep(&f.m.attn, s, rows, lay_i, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.cache(i));
+             try kernels.relTable(&f.m.attn, s, rows, b.relo, a.rel_proj, b.tab);
+-            try kernels.attend(&f.m.attn, s, rows, lay_i, p.stride, b.parts.slots, b.qo, st.kc[i], st.vc[i], b.tab, b.parts.o, b.parts.ml, b.sink, b.gate, b.att);
++            try kernels.attend(&f.m.attn, s, rows, lay_i, p.stride, b.parts.slots, b.qo, st.cache(i), b.tab, b.parts.o, b.parts.ml, b.sink, b.gate, b.att);
+             try f.dense(a.o, b.att, n, f.slot(b.ao, n), .f32);
+             const ao = try f.summed(b.ao, n);
+             const boundary = i % c.block_layers == 0;
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 80e0e0c..ca0dede 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -28,16 +28,31 @@ pub const Layer = struct {
+     ring: u32,
+     chunk: u32,
+     tau: bool,
++    kv8: bool = false, // fp8 caches (global layers, TF_INKLING2_KV=fp8): e4m3 [slot][kv_head][128] plus fp32 scales
+ 
+     pub fn sliding(window: u32, rows: u32) Layer {
+         return .{ .window = window, .ring = ringFor(window, rows), .chunk = sliding_chunk, .tau = false };
+     }
+ 
+-    pub fn global(capacity: u32) Layer {
+-        return .{ .window = 0, .ring = @intCast(std.mem.alignForward(usize, capacity, tile_keys)), .chunk = global_chunk, .tau = true };
++    pub fn global(capacity: u32, kv8: bool) Layer {
++        return .{ .window = 0, .ring = @intCast(std.mem.alignForward(usize, capacity, tile_keys)), .chunk = global_chunk, .tau = true, .kv8 = kv8 };
++    }
++
++    /// Bytes of one stream's K (or V) cache on a rank with `kv` key heads: bf16 rows, or e4m3 rows and their scales.
++    pub fn cacheBytes(l: Layer, kv: usize) usize {
++        const per: usize = if (l.kv8) head_dim + 4 else head_dim * 2;
++        return @as(usize, l.ring) * kv * per;
++    }
++
++    /// Bytes of one stream's K (or V) scales (fp8 caches only; every slot's scales follow every slot's rows).
++    pub fn scaleBytes(l: Layer, kv: usize) usize {
++        return if (l.kv8) @as(usize, l.ring) * kv * 4 else 0;
+     }
+ };
+ 
++/// A layer's caches (addresses): K and V rows, and with fp8 rows each one's scales [slot][kv_head] (fp32).
++pub const Cache = struct { k: u64, v: u64, ks: u64 = 0, vs: u64 = 0 };
++
+ /// Sliding ring slots: the window plus a call's rows less one, so a chunk never overwrites keys it still reads.
+ pub fn ringFor(window: u32, rows: u32) u32 {
+     return @intCast(std.mem.alignForward(usize, @as(usize, window) + rows - 1, tile_keys));
+@@ -82,6 +97,9 @@ pub const Kernels = struct {
+     attn: cuda.Function,
+     attn_fold: cuda.Function,
+     merge: cuda.Function,
++    prep8: cuda.Function,
++    attn8: cuda.Function,
++    attn_fold8: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -94,6 +112,9 @@ pub const Kernels = struct {
+             .attn = try mod.function("tf_ink2_attn"),
+             .attn_fold = try mod.function("tf_ink2_attn_fold"),
+             .merge = try mod.function("tf_ink2_merge"),
++            .prep8 = try mod.function("tf_ink2_prep8"),
++            .attn8 = try mod.function("tf_ink2_attn8"),
++            .attn_fold8 = try mod.function("tf_ink2_attn_fold8"),
+         };
+     }
+ 
+@@ -128,17 +149,18 @@ fn go(f: cuda.Function, s: cuda.Stream, grid: cuda.Dim3, threads: u32, a: *cuda.
+ }
+ 
+ /// q, rel (per head) and k, v (per key head, written to the caches at pos % ring) from the projections' rows.
+-pub fn prep(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw: [4]u64, scales: [2]u64, q: u64, rel: u64, kc: u64, vc: u64) !void {
++pub fn prep(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw: [4]u64, scales: [2]u64, q: u64, rel: u64, kv: Cache) !void {
+     var a: cuda.Args = .{};
+     for (raw) |v| a.add(v);
+     for (scales) |v| a.add(v);
+-    for ([_]u64{ r.pos, r.seg_of, r.segs, q, rel, kc, vc }) |v| a.add(v);
++    for ([_]u64{ r.pos, r.seg_of, r.segs, q, rel, kv.k, kv.v }) |v| a.add(v);
+     a.add(int(r.heads));
+     a.add(int(r.kv_heads));
+     a.add(int(l.ring));
+     a.add(int(@intFromBool(l.tau)));
+     for ([_]f32{ c.qk_clip, c.rel_clip, c.floor, c.alpha, c.eps }) |v| a.add(v);
+-    try go(k.prep, s, .{ .x = r.rows, .y = r.heads + 2 * r.kv_heads }, 32, &a);
++    if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| a.add(v);
++    try go(if (l.kv8) k.prep8 else k.prep, s, .{ .x = r.rows, .y = r.heads + 2 * r.kv_heads }, 32, &a);
+ }
+ 
+ /// The bias table of each (row, head): its rel vector against the layer's rel_logits_proj [16][1024].
+@@ -149,11 +171,12 @@ pub fn relTable(k: *const Kernels, s: cuda.Stream, r: Rows, rel: u64, proj: u64,
+ }
+ 
+ /// Attention into chunk partials (`stride` a row and head; a split call's sub-chunks), then the ordered merge.
+-pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32, slots: usize, q: u64, kc: u64, vc: u64, tab: u64, part_o: u64, part_ml: u64, sink: u64, gate: u64, out: u64) !void {
++pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32, slots: usize, q: u64, kv: Cache, tab: u64, part_o: u64, part_ml: u64, sink: u64, gate: u64, out: u64) !void {
+     if (slotsFor(l, r.last_pos + 1) > stride) return error.Inkling2Partials;
++    if (l.kv8 and l.window > 0) return error.Inkling2Kv8Sliding;
+     const scale: f32 = 1.0 / @sqrt(@as(f32, head_dim));
+     var a: cuda.Args = .{};
+-    for ([_]u64{ q, kc, vc, tab, r.segs, r.tiles, part_o, part_ml }) |v| a.add(v);
++    for ([_]u64{ q, kv.k, kv.v, tab, r.segs, r.tiles, part_o, part_ml }) |v| a.add(v);
+     var slots_rh = stride; // partials a row and head
+     var per: u32 = 1; // partials a chunk: its sub-chunks' when split
+     if (l.window > 0) {
+@@ -168,11 +191,13 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, 0, l.chunk, 0, slots_rh }) |v| a.add(int(v));
+         a.add(scale);
+         a.add(int(1));
+-        try go(k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = slots_rh }, 128, &a);
++        if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| a.add(v);
++        try go(if (l.kv8) k.attn8 else k.attn, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = slots_rh }, 128, &a);
+     } else { // a block a chunk, its sub-chunks folded in order
+         for ([_]u32{ r.heads, r.kv_heads, l.ring, l.chunk, 0, stride }) |v| a.add(int(v));
+         a.add(scale);
+-        try go(k.attn_fold, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = stride }, 128, &a);
++        if (l.kv8) for ([_]u64{ kv.ks, kv.vs }) |v| a.add(v);
++        try go(if (l.kv8) k.attn_fold8 else k.attn_fold, s, .{ .x = r.n_tiles, .y = r.kv_heads, .z = stride }, 128, &a);
+     }
+     var b: cuda.Args = .{};
+     for ([_]u64{ part_o, part_ml, sink, gate, r.pos, out }) |v| b.add(v);
+diff --git a/zig/src/families/inkling2/kernels_test.zig b/zig/src/families/inkling2/kernels_test.zig
+index e2009b1..043453e 100644
+--- a/zig/src/families/inkling2/kernels_test.zig
++++ b/zig/src/families/inkling2/kernels_test.zig
+@@ -28,8 +28,8 @@ test "inkling2 kernels: chunks and scratch at the context targets (1M x 1 and 8
+     const s = k.Layer.sliding(1024, 2048);
+     try t.expectEqual(@as(u32, 3072), s.ring);
+     try t.expect(s.ring % k.tile_keys == 0 and s.ring >= 1024 + 2048 - 1);
+-    try t.expectEqual(@as(u32, 1048576), k.Layer.global(1048576).ring);
+-    try t.expectEqual(@as(u32, 131136), k.Layer.global(131073).ring);
++    try t.expectEqual(@as(u32, 1048576), k.Layer.global(1048576, false).ring);
++    try t.expectEqual(@as(u32, 131136), k.Layer.global(131073, false).ring);
+ }
+ 
+ test "inkling2 kernels: the loader type-checks in a build with kernels" {
+@@ -38,9 +38,9 @@ test "inkling2 kernels: the loader type-checks in a build with kernels" {
+ }
+ 
+ const Fake = struct {
+-    var grids: [4][3]u32 = undefined;
+-    var blocks: [4]u32 = undefined;
+-    var shared: [4]u32 = undefined;
++    var grids: [7][3]u32 = undefined;
++    var blocks: [7]u32 = undefined;
++    var shared: [7]u32 = undefined;
+     var count: usize = 0;
+     fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, sh: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
+         const i = @intFromPtr(f) - 1;
+@@ -60,34 +60,56 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
+             return .{ .d = drv, .handle = @ptrFromInt(i) };
+         }
+     };
+-    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3) };
++    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .prep8 = fun.of(&d, 5), .attn8 = fun.of(&d, 6), .attn_fold8 = fun.of(&d, 7) };
+     const s: cuda.Stream = .{ .d = &d, .handle = null };
+     const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
+-    const l = k.Layer.global(1048576);
+-    try k.prep(&kern, s, r, l, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, 0, 0);
++    const l = k.Layer.global(1048576, false);
++    try k.prep(&kern, s, r, l, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, .{ .k = 0, .v = 0 });
+     try k.relTable(&kern, s, r, 0, 0, 0);
+     const all = 24 * 64 * k.subs;
+-    try k.attend(&kern, s, r, l, 64, all, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+-    try t.expectError(error.Inkling2Partials, k.attend(&kern, s, r, l, 63, all, 0, 0, 0, 0, 0, 0, 0, 0, 0));
++    try k.attend(&kern, s, r, l, 64, all, 0, .{ .k = 0, .v = 0 }, 0, 0, 0, 0, 0, 0);
++    try t.expectError(error.Inkling2Partials, k.attend(&kern, s, r, l, 63, all, 0, .{ .k = 0, .v = 0 }, 0, 0, 0, 0, 0, 0));
+     try t.expectEqual(@as(usize, 4), Fake.count);
+     try t.expectEqual([3]u32{ 1, 32, 1 }, Fake.grids[0]);
+     try t.expectEqual([3]u32{ 24, 1, 1 }, Fake.grids[1]);
+     try t.expectEqual([3]u32{ 1, 4, 64 * k.subs }, Fake.grids[2]);
+     try t.expectEqual([3]u32{ 24, 1, 1 }, Fake.grids[3]);
+-    try t.expectEqual([4]u32{ 32, 256, 128, 128 }, Fake.blocks);
+-    try t.expectEqual([4]u32{ 0, 0, 0, 0 }, Fake.shared);
++    try t.expectEqual([4]u32{ 32, 256, 128, 128 }, Fake.blocks[0..4].*);
++    try t.expectEqual([4]u32{ 0, 0, 0, 0 }, Fake.shared[0..4].*);
+     // too few partials for every sub-chunk: one block a chunk, its sub-chunks folded inside
+-    try k.attend(&kern, s, r, l, 64, all - 1, 0, 0, 0, 0, 0, 0, 0, 0, 0);
++    try k.attend(&kern, s, r, l, 64, all - 1, 0, .{ .k = 0, .v = 0 }, 0, 0, 0, 0, 0, 0);
+     try t.expectEqual([3]u32{ 1, 4, 64 }, Fake.grids[2]);
+     try t.expect(!k.split(.{ .rows = 65, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 7, .last_pos = 100 }, 1, 1 << 30));
++    // fp8 caches: the same grids on the fp8 kernels, and a sliding layer never takes them
++    const l8 = k.Layer.global(1048576, true);
++    const kv8: k.Cache = .{ .k = 0, .v = 0, .ks = 64, .vs = 64 };
++    try k.prep(&kern, s, r, l8, .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 }, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, kv8);
++    try k.attend(&kern, s, r, l8, 64, all, 0, kv8, 0, 0, 0, 0, 0, 0);
++    try k.attend(&kern, s, r, l8, 64, all - 1, 0, kv8, 0, 0, 0, 0, 0, 0);
++    try t.expectEqual([3]u32{ 1, 32, 1 }, Fake.grids[4]);
++    try t.expectEqual([3]u32{ 1, 4, 64 * k.subs }, Fake.grids[5]);
++    try t.expectEqual([3]u32{ 1, 4, 64 }, Fake.grids[6]);
++    var sl8 = k.Layer.sliding(1024, 1);
++    sl8.kv8 = true;
++    try t.expectError(error.Inkling2Kv8Sliding, k.attend(&kern, s, r, sl8, 64, all, 0, kv8, 0, 0, 0, 0, 0, 0));
++}
++
++test "inkling2 kernels: an fp8 stream at 1M holds 132 of the 256 bytes a key head and token of a bf16 one" {
++    const b = k.Layer.global(1048576, false);
++    const f = k.Layer.global(1048576, true);
++    try t.expectEqual(@as(usize, 1048576 * 4 * 256), b.cacheBytes(4));
++    try t.expectEqual(@as(usize, 1048576 * 4 * 132), f.cacheBytes(4));
++    try t.expectEqual(@as(usize, 1048576 * 4 * 4), f.scaleBytes(4));
++    try t.expectEqual(@as(usize, 0), b.scaleBytes(4));
++    try t.expectEqual(k.Layer.sliding(1024, 2048).cacheBytes(4), 3072 * 4 * 256);
+ }
+ 
+ test "inkling2 kernels: sliding partials are a row's window at any depth, a tile's launch a fixed chunk count" {
+     const sl = k.Layer.sliding(1024, 1);
+     try t.expectEqual(@as(u32, 5), k.slotsFor(sl, 1048576)); // keys pos-1023..pos touch at most 5 chunks of 256
+     try t.expectEqual(@as(u32, 6), k.tileChunks(6, sl)); // a tile's 12 rows and their windows: 6 chunks
+-    try t.expectEqual(@as(u32, 64), k.slotsFor(k.Layer.global(1048576), 1048576));
+-    try t.expectEqual(@as(u32, 8), k.slotsFor(k.Layer.global(131072), 131072));
++    try t.expectEqual(@as(u32, 64), k.slotsFor(k.Layer.global(1048576, false), 1048576));
++    try t.expectEqual(@as(u32, 8), k.slotsFor(k.Layer.global(131072, false), 131072));
+ }
+ 
+ /// A call's sliding stores as tf_ink2_attn makes them: each slot the merge reads once; returns the old strays.
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index ddf5af7..608bfd5 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -159,6 +159,7 @@ pub const rules = [_]Rule{
+     .{ .name = "TF_INKLING2_WORLD", .scope = .cuda, .kind = .u32, .min = 1, .forms = "a whole rank count from 1 (Inkling 2 admits 2)" },
+     .{ .name = "TF_INKLING2_PROFILE", .scope = .cuda, .kind = .flag, .forms = "0 or 1" },
+     .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .scope = .cuda, .kind = .word, .trim = " ", .words = &.{ "bf16", "nvfp4" }, .forms = "bf16 or nvfp4" },
++    .{ .name = "TF_INKLING2_KV", .scope = .cuda, .kind = .word, .trim = " ", .words = &.{ "bf16", "fp8" }, .forms = "bf16 or fp8" },
+ };
+ 
+ pub fn rule(name: []const u8) Rule {
+diff --git a/zig/src/platform/environment_test.zig b/zig/src/platform/environment_test.zig
+index 3fc77a2..efcc55d 100644
+--- a/zig/src/platform/environment_test.zig
++++ b/zig/src/platform/environment_test.zig
+@@ -101,6 +101,7 @@ const valid = [_]Case{
+     .{ .name = "TF_INKLING2_WORLD", .raw = "2", .n = 2 },
+     .{ .name = "TF_INKLING2_PROFILE", .raw = "1", .n = 1 },
+     .{ .name = "TF_INKLING2_DRAFT_WEIGHTS", .raw = "nvfp4", .n = 1 },
++    .{ .name = "TF_INKLING2_KV", .raw = "fp8", .n = 1 },
+ };
+ 
+ test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {

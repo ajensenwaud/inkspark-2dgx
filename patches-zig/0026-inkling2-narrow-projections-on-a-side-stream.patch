@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:47:52 +1100
+Subject: [PATCH 26/45] inkling2: narrow projections on a side stream
+
+r, k and v (384 and 512 outputs a rank) launch 24 and 32 blocks and run
+at 67-84 GB/s, about 2 ms of the 1-row decode step on their own. They and
+the attention-sink and dynamic-conv row dots now run on a second stream,
+with their own EXL3 scratch, beside q and the gate; the main stream waits
+for them before the convs. Same kernels on the same inputs: equal bits.
+---
+ zig/src/families/inkling2/engine.zig  |  1 +
+ zig/src/families/inkling2/forward.zig | 53 ++++++++++++++++++++++-----
+ 2 files changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index f59aee7..2b3ed79 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -108,6 +108,7 @@ pub const Engine = struct {
+         errdefer e.bd.deinit();
+         for (e.w.layers) |l| for ([_]cuda.exl3.Weight{ l.attn.q, l.attn.k, l.attn.v, l.attn.r, l.attn.gate, l.attn.o }) |x| try e.m.dense.reserve(stream, x);
+         try e.m.dense.reserve(stream, e.w.head); // scratch grown now, so nothing allocates inside a graph capture
++        for (e.w.layers) |l| for ([_]cuda.exl3.Weight{ l.attn.k, l.attn.v, l.attn.r }) |x| try e.m.side.dense.reserve(stream, x);
+         if (o.drafts and ds.present(io, gpa, dir)) try e.loadDrafter(dir, o.capacity);
+         errdefer e.freeDrafter();
+         e.vision = o.vision;
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index 347e38f..037ce7a 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -16,6 +16,7 @@ pub const Modules = struct {
+     experts: cuda.exl3_experts.Experts,
+     attn: kernels.Kernels,
+     ops: ops.Kernels,
++    side: Side,
+ 
+     pub fn load(d: *const cuda.Driver) !Modules {
+         var dense = try cuda.exl3.Dense.load(d);
+@@ -24,10 +25,13 @@ pub const Modules = struct {
+         errdefer ex.unload();
+         var attn = try kernels.Kernels.load(d);
+         errdefer attn.unload();
+-        return .{ .dense = dense, .experts = ex, .attn = attn, .ops = try ops.Kernels.load(d) };
++        var o = try ops.Kernels.load(d);
++        errdefer o.unload();
++        return .{ .dense = dense, .experts = ex, .attn = attn, .ops = o, .side = try Side.init(d) };
+     }
+ 
+     pub fn deinit(m: *Modules) void {
++        m.side.deinit();
+         m.ops.unload();
+         m.attn.unload();
+         m.experts.unload();
+@@ -35,6 +39,31 @@ pub const Modules = struct {
+     }
+ };
+ 
++/// A layer's narrow projections (r, k, v, row dots) run here beside q and the gate, on their own EXL3 scratch.
++pub const Side = struct {
++    stream: cuda.Stream,
++    fork: cuda.Event,
++    join: cuda.Event,
++    dense: cuda.exl3.Dense,
++
++    fn init(d: *const cuda.Driver) !Side {
++        var st = try cuda.Stream.init(d, true);
++        errdefer st.deinit();
++        var fork = try cuda.Event.init(d, false);
++        errdefer fork.deinit();
++        var join = try cuda.Event.init(d, false);
++        errdefer join.deinit();
++        return .{ .stream = st, .fork = fork, .join = join, .dense = try cuda.exl3.Dense.load(d) };
++    }
++
++    fn deinit(x: *Side) void {
++        x.dense.unload();
++        x.join.deinit();
++        x.fork.deinit();
++        x.stream.deinit();
++    }
++};
++
+ /// The geometry a stream's caches and a call's scratch are sized for.
+ pub const Shape = struct {
+     rows: usize, // most rows a call takes
+@@ -423,17 +452,23 @@ pub const Forward = struct {
+             const xk = if (global) b.normed + n * h * 2 else xq;
+             const xv = if (global) b.normed + 2 * n * h * 2 else xq;
+             const a = &l.attn;
++            const sd = &f.m.side;
++            const ss = sd.stream;
++            try sd.fork.record(s);
++            try ss.wait(sd.fork);
++            try sd.dense.decode(ss, a.r, xq, .bf16, n, b.r, .bf16);
++            try sd.dense.decode(ss, a.k, xk, .bf16, n, b.kf, .f32);
++            try sd.dense.decode(ss, a.v, xv, .bf16, n, b.vf, .f32);
++            try ops.rowdot(k, ss, xq, a.sink, b.sink, n, f.shape.heads, h, true, false);
++            if (global) {
++                try ops.rowdot(k, ss, xk, a.k_proj, b.dk, n, f.shape.kv * c.conv, h, false, false);
++                try ops.rowdot(k, ss, xv, a.v_proj, b.dv, n, f.shape.kv * c.conv, h, false, false);
++            }
++            try sd.join.record(ss);
+             try f.dense(a.q, xq, n, b.q, .bf16);
+-            try f.dense(a.r, xq, n, b.r, .bf16);
+             try f.dense(a.gate, xq, n, b.gate, .bf16);
+-            try f.dense(a.k, xk, n, b.kf, .f32);
+-            try f.dense(a.v, xv, n, b.vf, .f32);
+-            try ops.rowdot(k, s, xq, a.sink, b.sink, n, f.shape.heads, h, true, false);
++            try s.wait(sd.join);
+             const cv = st.conv[i];
+-            if (global) {
+-                try ops.rowdot(k, s, xk, a.k_proj, b.dk, n, f.shape.kv * c.conv, h, false, false);
+-                try ops.rowdot(k, s, xv, a.v_proj, b.dv, n, f.shape.kv * c.conv, h, false, false);
+-            }
+             try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw, .segs = conv_segs, .hist = f.hist(i, 0), .state_stride = @intCast(3 * kvw) }, streams);
+             try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw, .segs = conv_segs, .hist = f.hist(i, 1), .state_stride = @intCast(3 * kvw) }, streams);
+             var lay_i = f.shape.layer(c, i);

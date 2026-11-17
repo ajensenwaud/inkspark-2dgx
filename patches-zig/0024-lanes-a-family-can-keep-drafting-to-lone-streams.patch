@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:10:02 +1100
+Subject: [PATCH 24/45] lanes: a family can keep drafting to lone streams
+
+Inkling 2 runs its DSpark pass a stream at a time, so a shared round
+that drafts pays ~16 ms a stream. Served on the full pack, drafted
+shared rounds lost to plain at 4 streams (55 vs 67 tok/s) and 8 (67 vs
+87) even with the passes priced. With lone_drafts set, budgets returns
+zero drafts whenever a round holds more than one stream.
+---
+ zig/src/core/lanes/config.zig           |  2 ++
+ zig/src/core/lanes/depth.zig            |  1 +
+ zig/src/core/lanes/depth_constants.zig  |  1 +
+ zig/src/core/lanes/shared_pass_test.zig | 20 ++++++++++++++++++++
+ zig/src/families/inkling2/lanes.zig     |  1 +
+ 5 files changed, 25 insertions(+)
+
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index ae7af03..c646258 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -37,6 +37,7 @@ pub const Model = struct {
+     shared_step_ms: ?f64 = null, // a separate shared head step; null keeps mtp_step_ms
+     draft_step_ms: f64 = 0.0, // a shared round's draft past a stream's first, as the backend's head runs it (0: priced free)
+     draft_passes: bool = false, // draft_step_ms is each drafting stream's whole pass in a shared round, whatever its depth
++    lone_drafts: bool = false, // only a lone stream drafts; shared rounds go plain
+     streams_exact: bool = true, // shared forwards keep each stream's bits
+     hidden_rows: bool = false, // the backend runs several streams' windows in one forward
+     batch_rows: u32 = 0, // a shared forward's rows at most (0: 32)
+@@ -188,6 +189,7 @@ pub const Config = struct {
+                 .short_slack = if (m.draft_slack > 0) m.draft_slack else (Constants{}).short_slack,
+                 .copy_first = m.copy_first and !m.context_copies,
+                 .hold_costs = m.hold_costs,
++                .lone_drafts = m.lone_drafts,
+             },
+             .draft_step_ms = m.draft_step_ms,
+             .draft_passes = m.draft_passes,
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 852d906..658c68d 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -299,6 +299,7 @@ pub const Rule = struct {
+ 
+     /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
+     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, sampled: bool, out: []i64) !void {
++        if (r.k.lone_drafts and whos.len > 1) return @memset(out, 0);
+         if (r.confidence_floor != null) {
+             for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
+             return;
+diff --git a/zig/src/core/lanes/depth_constants.zig b/zig/src/core/lanes/depth_constants.zig
+index 5f8ad83..c2ceffd 100644
+--- a/zig/src/core/lanes/depth_constants.zig
++++ b/zig/src/core/lanes/depth_constants.zig
+@@ -11,6 +11,7 @@ pub const Constants = struct {
+     draft_slack: i64 = 2, // drafts a stream offers past what its last shared round granted it
+     grant_slack: i64 = 1, // granted depths: drafts past a grant that verified every draft the stream held
+     short_slack: i64 = 0, // granted depths: drafts past a grant that left some of them unverified
++    lone_drafts: bool = false, // only a lone stream drafts: shared rounds go plain (a head that runs a pass a stream)
+     copy_first: bool = false, // a copy ahead takes the next round whole: the head drafts none for it (else one)
+     hold_costs: []const @import("hold_price.zig").HoldCost = &.{}, // a drafter's own hold pass by blocks and depth: granted holds must pay for it
+ };
+diff --git a/zig/src/core/lanes/shared_pass_test.zig b/zig/src/core/lanes/shared_pass_test.zig
+index 883d587..e82e402 100644
+--- a/zig/src/core/lanes/shared_pass_test.zig
++++ b/zig/src/core/lanes/shared_pass_test.zig
+@@ -109,3 +109,23 @@ test "a shared round's measured overhead leaves out the passes its budgets price
+     try rule.observeOverhead(4, 8, elapsed - rule.pricedDraftMs(&depths), false, rule.headMs(&depths));
+     try t.expectApproxEqAbs(@as(f64, 5.0), rule.overheadMs(4, false), 1e-9);
+ }
++
++test "lone drafts: a shared round goes plain whatever the rates, a lone stream keeps its rule" {
++    const t = std.testing;
++    var costs = try alloc.extendCosts(t.allocator, &shared_ms, 64);
++    defer costs.deinit(t.allocator);
++    const empty: Table = .{};
++    var rule = inkRule(&costs, &empty, &code, true);
++    rule.k.lone_drafts = true;
++    defer rule.deinit();
++    var states: [4]?State = @splat(null);
++    defer for (&states) |*s| if (s.*) |*x| x.deinit(t.allocator);
++    var whos: [4]Who = undefined;
++    for (&whos, &states) |*w, *s| w.* = .{ .state = s, .draft_room = 100, .finished = false, .forced = false };
++    var out: [4]i64 = @splat(9);
++    try rule.budgets(&whos, probe, false, &out);
++    try t.expectEqualSlices(i64, &.{ 0, 0, 0, 0 }, &out);
++    var one: [1]i64 = .{0};
++    try rule.budgets(whos[0..1], probe, false, &one);
++    try t.expect(one[0] > 0);
++}
+diff --git a/zig/src/families/inkling2/lanes.zig b/zig/src/families/inkling2/lanes.zig
+index 687f769..ff484e4 100644
+--- a/zig/src/families/inkling2/lanes.zig
++++ b/zig/src/families/inkling2/lanes.zig
+@@ -83,6 +83,7 @@ pub const Lanes = struct {
+             .mtp_step_ms = if (head) 16.4 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (16.4 ms timed)
+             .draft_step_ms = if (head) 15.9 else 0, // a shared round's block pass, a stream at a time (127.1 ms for 8)
+             .draft_passes = head, // whatever the depth: a stream's 1 draft costs the pass its 7 do
++            .lone_drafts = head, // passes run a stream at a time: shared drafts lost at 4 and 8 streams (G7)
+             .plain_guard = head, // plain rounds compete: one-row forwards are cheap next to a draft pass
+             .window_costs = if (head) &gb10_window_costs else &.{},
+             .window_costs_lone = true,

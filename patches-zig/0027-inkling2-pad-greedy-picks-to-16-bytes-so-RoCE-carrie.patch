@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 01:49:48 +1100
+Subject: [PATCH 27/45] inkling2: pad greedy picks to 16 bytes so RoCE carries
+ them
+
+The RoCE gather takes multiples of 16 bytes. A rank's greedy pick is a
+value and an id, 8 bytes, so every 1-row draw and each of a draft
+block's 7 walk steps fell back to NCCL over TCP sockets. The eager
+profile shows the draft pass at 10.1 ms of kernels in a 15.5 ms span.
+Picks now sit 16 bytes apart a rank; the values and ids are unchanged.
+---
+ zig/kernels/cuda/inkling2/dspark.cu      |  6 +++---
+ zig/src/families/inkling2/dspark_run.zig |  8 ++++----
+ zig/src/families/inkling2/engine.zig     | 18 ++++++++++++------
+ 3 files changed, 19 insertions(+), 13 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/dspark.cu b/zig/kernels/cuda/inkling2/dspark.cu
+index 356c0af..67cfd20 100644
+--- a/zig/kernels/cuda/inkling2/dspark.cu
++++ b/zig/kernels/cuda/inkling2/dspark.cu
+@@ -310,13 +310,13 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_vocab(const uint16
+     out[v] = v < valid ? bfr(tanhf(x / cap) * cap) : -INFINITY;
+ }
+ 
+-// The ranks' (value, id) picks merged: the largest value, the lowest id among equals, into walk[j + 1].
++// The ranks' (value, id) picks, 16 bytes apart: the largest value, the lowest id among equals, into walk[j + 1].
+ extern "C" __global__ void tf_ink2_dsp_pick(const float* __restrict__ picks, int world, int* __restrict__ walk, int j) {
+     float bv = -INFINITY;
+     int bi = 0x7fffffff;
+     for (int q = 0; q < world; ++q) {
+-        const float v = picks[q * 2];
+-        const int i = reinterpret_cast<const int*>(picks)[q * 2 + 1];
++        const float v = picks[q * 4];
++        const int i = reinterpret_cast<const int*>(picks)[q * 4 + 1];
+         if (v > bv || (v == bv && i < bi)) {
+             bv = v;
+             bi = i;
+diff --git a/zig/src/families/inkling2/dspark_run.zig b/zig/src/families/inkling2/dspark_run.zig
+index 10e785f..1454c03 100644
+--- a/zig/src/families/inkling2/dspark_run.zig
++++ b/zig/src/families/inkling2/dspark_run.zig
+@@ -92,7 +92,7 @@ pub const Drafter = struct {
+     state: u64 = 0,
+     latent: u64 = 0,
+     scores: u64 = 0, // fp32 [nv]
+-    picks: u64 = 0, // every rank's (value, id), 8 bytes each
++    picks: u64 = 0, // every rank's (value, id), padded to 16 bytes so the RoCE gather takes it
+     walk: u64 = 0, // int32 [T]: the anchor, then each step's pick
+     ids: u64 = 0,
+     mixed: u64 = 0, // bf16 [ctx_rows][hidden]
+@@ -118,7 +118,7 @@ pub const Drafter = struct {
+         for (w.layers[0..w.c.layers]) |l| part = @max(part, dr.lane.partBytes(ctx_rows, l.kv));
+         const R: usize = w.c.rank;
+         const qkvw = (dr.hq + 2 * dr.hk) * 128;
+-        const sizes = [_]usize{ part, dr.nv * R * 2, dr.nv * 2, T * h * 2, T * h * 2, T * qkvw * 2, T * dr.hq * 128 * 2, T * dr.hq * 128 * 2, T * 2 * dr.inter * 2, T * dr.inter * 2, dr.world * T * h * 4, dk.chunks(0, capacity) * T * dr.hq * 128 * 4, dk.chunks(0, capacity) * T * dr.hq * 8, T * dr.nv * 2, T * 3 * R * 4, R * 2, R * 2, dr.nv * 4, dr.world * 8, T * 4, T * 4, ctx_rows * h * 2, ctx_rows * 2 * dr.hk * 128 * 2 };
++        const sizes = [_]usize{ part, dr.nv * R * 2, dr.nv * 2, T * h * 2, T * h * 2, T * qkvw * 2, T * dr.hq * 128 * 2, T * dr.hq * 128 * 2, T * 2 * dr.inter * 2, T * dr.inter * 2, dr.world * T * h * 4, dk.chunks(0, capacity) * T * dr.hq * 128 * 4, dk.chunks(0, capacity) * T * dr.hq * 8, T * dr.nv * 2, T * 3 * R * 4, R * 2, R * 2, dr.nv * 4, dr.world * 16, T * 4, T * 4, ctx_rows * h * 2, ctx_rows * 2 * dr.hk * 128 * 2 };
+         var ptrs: [sizes.len]u64 = undefined;
+         for (sizes, &ptrs) |n, *p| {
+             var b = try Buf.alloc(d, @max(n, 256));
+@@ -248,13 +248,13 @@ pub const Drafter = struct {
+             try dk.rnn(&dr.k, s, dr.mctx + j * 3 * R * 4, dr.w.rnn, dr.w.w1, dr.walk, j, dr.state, dr.latent, R, h);
+             try dk.vocab(&dr.k, s, dr.base + j * dr.nv * 2, dr.latent, dr.fold, dr.fbias, dr.cap, dr.valid, dr.nv, dr.scores);
+             if (dr.keep_logits != 0) try dr.copy(s, dr.keep_logits + j * dr.nv * 4, dr.scores, dr.nv * 4);
+-            const mine = dr.picks + dr.rank * 8;
++            const mine = dr.picks + dr.rank * 16;
+             if (race) |r| {
+                 try ops.race1(&m.ops, s, dr.scores, dr.valid, dr.vlo, r.seed, r.inv_t, p + 1 + j, mine, mine + 4);
+             } else try ops.top1(&m.ops, s, dr.scores, 1, dr.nv, dr.nv, dr.vlo, mine, mine + 4);
+             switch (ex) {
+                 .local => {},
+-                .nccl => |x| if (x.group) |g| try g.allGather(s, mine, dr.picks, 8) else try x.lib.check(x.lib.api.ncclAllGather(mine, dr.picks, 8, .u8, x.comm, s.handle), "ncclAllGather"),
++                .nccl => |x| if (x.group) |g| try g.allGather(s, mine, dr.picks, 16) else try x.lib.check(x.lib.api.ncclAllGather(mine, dr.picks, 16, .u8, x.comm, s.handle), "ncclAllGather"),
+             }
+             try dk.pick(&dr.k, s, dr.picks, dr.world, dr.walk, j);
+         }
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 2b3ed79..4e08db0 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -114,9 +114,9 @@ pub const Engine = struct {
+         e.vision = o.vision;
+         if (o.vision != null and rank == 0) e.tower = try vision.Tower.load(gpa, io, d, dir, pictures.picture_tokens);
+         errdefer if (e.tower) |t| t.deinit();
+-        e.picks = try cuda.DeviceBuffer.alloc(d, world * shared_rows * 8);
++        e.picks = try cuda.DeviceBuffer.alloc(d, world * pickStride(shared_rows));
+         errdefer e.picks.free();
+-        e.picks_host = try gpa.alloc(u8, world * shared_rows * 8);
++        e.picks_host = try gpa.alloc(u8, world * pickStride(shared_rows));
+         errdefer gpa.free(e.picks_host);
+         e.smp = try sampler.Sampler.init(d, e.w.padded_vocab, shared_rows);
+         errdefer e.smp.deinit();
+@@ -407,21 +407,22 @@ pub const Engine = struct {
+             try e.smp.draw(e.stream, e.exchange, e.spans, rows, first, sampler.rule(s), out);
+             return e.gathered();
+         }
+-        const vals = e.picks.ptr + sh.rank * rows * 8;
++        const stride = pickStride(rows);
++        const vals = e.picks.ptr + sh.rank * stride;
+         try ops.top1(&e.m.ops, e.stream, logits, rows, n, real, sh.vocab.lo, vals, vals + rows * 4);
+         switch (e.exchange) {
+             .local => {},
+-            .nccl => |x| if (x.group) |g| try g.allGather(e.stream, vals, e.picks.ptr, rows * 8) else try x.lib.check(x.lib.api.ncclAllGather(vals, e.picks.ptr, rows * 8, .u8, x.comm, e.stream.handle), "ncclAllGather"),
++            .nccl => |x| if (x.group) |g| try g.allGather(e.stream, vals, e.picks.ptr, stride) else try x.lib.check(x.lib.api.ncclAllGather(vals, e.picks.ptr, stride, .u8, x.comm, e.stream.handle), "ncclAllGather"),
+         }
+         try e.stream.synchronize();
+         try e.gathered();
+-        const bytes = e.picks_host[0 .. sh.world * rows * 8];
++        const bytes = e.picks_host[0 .. sh.world * stride];
+         try e.picks.download(0, bytes);
+         for (0..rows) |r| {
+             var best: f32 = -std.math.inf(f32);
+             var id: u32 = 0;
+             for (0..sh.world) |q| {
+-                const at = q * rows * 8;
++                const at = q * stride;
+                 const v: f32 = @bitCast(std.mem.readInt(u32, bytes[at + r * 4 ..][0..4], .little));
+                 const i = std.mem.readInt(u32, bytes[at + rows * 4 + r * 4 ..][0..4], .little);
+                 if (v > best or (v == best and i < id)) {
+@@ -482,3 +483,8 @@ pub const Engine = struct {
+         e.states.drop(id);
+     }
+ };
++
++/// A rank's greedy picks of `rows` rows (fp32 values, then i32 ids) padded to 16 bytes: the RoCE gather takes them.
++fn pickStride(rows: usize) usize {
++    return std.mem.alignForward(usize, rows * 8, 16);
++}

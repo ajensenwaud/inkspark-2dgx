@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:33:32 +1100
+Subject: [PATCH 08/45] inkling2: several streams in one forward call
+
+Forward.run takes a list of streams, each with its own cache slot and
+conv state; the attention gets one segment array for the sliding rings
+and one for the global caches, and the conv kernel runs a block row per
+stream. Grouped experts run in windows of 2,048 rows, the most the shared
+grouping kernel holds. tf-inkling2-cuda also runs every text at once, a
+slot each: on the 2-layer pack those logits equal each text run alone,
+byte for byte, for the prompt pass and for decode rows.
+---
+ zig/kernels/cuda/inkling2/ops.cu        |  14 ++-
+ zig/src/families/inkling2/dump_main.zig |  88 +++++++++++-----
+ zig/src/families/inkling2/forward.zig   | 130 +++++++++++++++++-------
+ zig/src/families/inkling2/ops.zig       |  10 +-
+ 4 files changed, 170 insertions(+), 72 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/ops.cu b/zig/kernels/cuda/inkling2/ops.cu
+index eac0d87..51e0d82 100644
+--- a/zig/kernels/cuda/inkling2/ops.cu
++++ b/zig/kernels/cuda/inkling2/ops.cu
+@@ -253,7 +253,9 @@ struct ConvArgs {
+     const uint16_t* base;   // bf16 [rows, C] (mode 1, null: zero)
+     float* resid;           // fp32 [rows, C] (modes 1 and 2)
+     uint16_t* out;          // bf16 [rows, C] (modes 0 and 2)
++    const int4* segs;       // per stream (blockIdx.y): row0, rows, state slot; null: one stream, all rows
+     long long part_stride;
++    long long state_stride;  // elements between the streams' states
+     int parts, x_bf16, round_in, heads, C, rows, mode;  // mode 0: out = y; 1: resid = base + bf16(y); 2: resid + bf16(y)
+ };
+ 
+@@ -261,9 +263,11 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv(const ConvArgs a)
+     const int c = blockIdx.x * blockDim.x + threadIdx.x;
+     if (c >= a.C) return;
+     const int C = a.C;
+-    float h0 = a.state[c], h1 = a.state[C + c], h2 = a.state[2 * C + c];
++    const int4 sg = a.segs ? a.segs[blockIdx.y] : make_int4(0, a.rows, 0, 0);
++    float* state = a.state + sg.z * a.state_stride;
++    float h0 = state[c], h1 = state[C + c], h2 = state[2 * C + c];
+     const int hd = a.dyn ? c / (C / a.heads) : 0;
+-    for (int t = 0; t < a.rows; ++t) {
++    for (int t = sg.x; t < sg.x + sg.y; ++t) {
+         const size_t at = static_cast<size_t>(t) * C + c;
+         float x = a.x_bf16 ? bf(static_cast<const uint16_t*>(a.x)[at]) : static_cast<const float*>(a.x)[at];
+         for (int r = 1; r < a.parts; ++r) x += static_cast<const float*>(a.x)[at + r * a.part_stride];
+@@ -293,9 +297,9 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv(const ConvArgs a)
+         h1 = h2;
+         h2 = x;
+     }
+-    a.state[c] = h0;
+-    a.state[C + c] = h1;
+-    a.state[2 * C + c] = h2;
++    state[c] = h0;
++    state[C + c] = h1;
++    state[2 * C + c] = h2;
+ }
+ 
+ // The final logit softcap in place: x = tanh(x / cap) * cap.
+diff --git a/zig/src/families/inkling2/dump_main.zig b/zig/src/families/inkling2/dump_main.zig
+index 56fe7b6..c7c1269 100644
+--- a/zig/src/families/inkling2/dump_main.zig
++++ b/zig/src/families/inkling2/dump_main.zig
+@@ -5,7 +5,8 @@ const cuda = @import("cuda");
+ const ink = @import("inkling2");
+ 
+ const usage = "usage: tf-inkling2-cuda <model dir> <ids.json> <out dir> [prompt chunk rows]\n" ++
+-    "  ids.json maps text names to token ids; writes <name>.prompt.f32 and <name>.decode.f32 ([rows][real vocab]);\n" ++
++    "  ids.json maps text names to token ids; writes <name>.<path>.f32 ([rows][real vocab]) for paths prompt, decode\n" ++
++    "  (each text alone) and streams-prompt, streams-decode (all texts at once, a slot each);\n" ++
+     "  at two ranks set TF_INKLING2_RANK, TF_INKLING2_WORLD and NCCL_COMM_ID: each writes its vocab rows (.r<rank>.f32)\n";
+ 
+ pub fn main(init: std.process.Init) !u8 {
+@@ -21,10 +22,22 @@ pub fn main(init: std.process.Init) !u8 {
+     var doc = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+     defer doc.deinit();
+     if (doc.value != .object) return error.BadIds;
++    const Text = struct { name: []const u8, ids: []i32 };
++    var list: std.ArrayList(Text) = .empty;
+     var longest: usize = 0;
++    var total: usize = 0;
+     var it = doc.value.object.iterator();
+-    while (it.next()) |e| longest = @max(longest, e.value_ptr.array.items.len);
+-    if (longest == 0) return error.BadIds;
++    while (it.next()) |e| {
++        const v = e.value_ptr.array.items;
++        const ids = try a.alloc(i32, v.len);
++        for (v, ids) |x, *id| id.* = @intCast(x.integer);
++        if (ids.len == 0) return error.BadIds;
++        try list.append(a, .{ .name = e.key_ptr.*, .ids = ids });
++        longest = @max(longest, ids.len);
++        total += ids.len;
++    }
++    const texts = list.items;
++    if (texts.len == 0 or texts.len > ink.forward.max_items) return error.BadIds;
+     const chunk = if (args.len == 5) try std.fmt.parseInt(usize, args[4], 10) else longest;
+ 
+     var driver = try cuda.Driver.open();
+@@ -56,10 +69,10 @@ pub fn main(init: std.process.Init) !u8 {
+     var w = try ink.weights.load(gpa, io, &driver, &m.dense, stream, args[1], c, place.rank, place.world);
+     defer w.deinit();
+     std.debug.print("rank {d}/{d}: loaded {d} layers, {d:.2} GiB in {d:.1} s, vocab [{d}, {d})\n", .{ place.rank, place.world, c.layers, gib(w.bytes), secs(io, t0), w.share.vocab.lo, w.share.vocab.hi });
+-    const shape: ink.forward.Shape = .{ .rows = @min(chunk, longest), .context = std.mem.alignForward(usize, longest + 1, 64), .heads = w.share.heads.len(), .kv = w.share.kv.len() };
++    const shape: ink.forward.Shape = .{ .rows = @max(@min(chunk, longest), total), .context = std.mem.alignForward(usize, longest + 1, 64), .heads = w.share.heads.len(), .kv = w.share.kv.len() };
+     var b = try ink.forward.Buffers.init(gpa, &driver, &w, shape);
+     defer b.deinit();
+-    var st = try ink.forward.State.init(gpa, &driver, &w.config, shape);
++    var st = try ink.forward.State.init(gpa, &driver, &w.config, shape, texts.len);
+     defer st.deinit();
+     var f: ink.forward.Forward = .{ .d = &driver, .m = &m, .w = &w, .b = &b, .shape = shape, .stream = stream };
+     if (lib) |*l| f.exchange = .{ .nccl = .{ .lib = l, .comm = comm } };
+@@ -70,32 +83,53 @@ pub fn main(init: std.process.Init) !u8 {
+     const real: usize = if (place.world == 1) c.real_vocab else nv; // a rank's rows: the check joins and trims them
+     const row = try gpa.alloc(f32, shape.rows * nv);
+     defer gpa.free(row);
+-    it = doc.value.object.iterator();
+-    while (it.next()) |e| {
+-        const list = e.value_ptr.array.items;
+-        const ids = try a.alloc(i32, list.len);
+-        for (list, ids) |v, *id| id.* = @intCast(v.integer);
+-        const all = try gpa.alloc(f32, ids.len * real);
+-        defer gpa.free(all);
+-        for ([_][]const u8{ "prompt", "decode" }) |path| {
+-            try stream.synchronize();
+-            try st.reset();
+-            t0 = std.Io.Clock.awake.now(io).toNanoseconds();
+-            const step = if (std.mem.eql(u8, path, "prompt")) shape.rows else 1;
++    const all = try a.alloc([]f32, texts.len);
++    for (all, texts) |*x, t| x.* = try a.alloc(f32, t.ids.len * real);
++    // each text alone (slot 0), as one prompt pass in chunks and as decode rows; then all texts at once, one slot each
++    for ([_][]const u8{ "prompt", "decode", "streams-prompt", "streams-decode" }) |path| {
++        const together = std.mem.startsWith(u8, path, "streams");
++        const step = if (std.mem.endsWith(u8, path, "prompt")) @min(chunk, longest) else 1;
++        t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++        if (together) try st.reset();
++        var items: [ink.forward.max_items]ink.forward.Item = undefined;
++        for (texts, 0..) |t, k| {
++            if (!together) try st.reset();
+             var at: usize = 0;
+-            while (at < ids.len) : (at += step) {
+-                const n = @min(step, ids.len - at);
+-                try f.run(&st, ids[at..][0..n]);
++            while (true) {
++                // together: one call per step over every text with rows left (its own slot), else this text in slot 0
++                var ni: usize = 0;
++                if (together) {
++                    if (k != 0) break;
++                    for (texts, 0..) |u, j| if (at < u.ids.len) {
++                        items[ni] = .{ .slot = j, .ids = u.ids[at..][0..@min(step, u.ids.len - at)] };
++                        ni += 1;
++                    };
++                } else if (at < t.ids.len) {
++                    items[0] = .{ .slot = 0, .ids = t.ids[at..][0..@min(step, t.ids.len - at)] };
++                    ni = 1;
++                }
++                if (ni == 0) break;
++                try f.run(&st, items[0..ni]);
+                 try stream.synchronize();
+-                try b.logits.download(0, std.mem.sliceAsBytes(row[0 .. n * nv]));
+-                for (0..n) |r| @memcpy(all[(at + r) * real ..][0..real], row[r * nv ..][0..real]);
++                var rows: usize = 0;
++                for (items[0..ni]) |x| rows += x.ids.len;
++                try b.logits.download(0, std.mem.sliceAsBytes(row[0 .. rows * nv]));
++                var r0: usize = 0;
++                for (items[0..ni]) |x| {
++                    const dst = all[if (together) x.slot else k];
++                    for (0..x.ids.len) |r| @memcpy(dst[(at + r) * real ..][0..real], row[(r0 + r) * nv ..][0..real]);
++                    r0 += x.ids.len;
++                }
++                at += step;
+             }
+-            var name: [96]u8 = undefined;
+-            const file = if (place.world == 1) try std.fmt.bufPrint(&name, "{s}.{s}.f32", .{ e.key_ptr.*, path }) else try std.fmt.bufPrint(&name, "{s}.{s}.r{d}.f32", .{ e.key_ptr.*, path, place.rank });
+-            try out.writeFile(io, .{ .sub_path = file, .data = std.mem.sliceAsBytes(all) });
+-            const last = all[(ids.len - 1) * real ..][0..real];
+-            std.debug.print("{s} {s}: {d} rows in {d:.2} s, last row argmax {d}\n", .{ e.key_ptr.*, path, ids.len, secs(io, t0), std.mem.indexOfMax(f32, last) });
+         }
++        for (texts, all) |t, x| {
++            var name: [128]u8 = undefined;
++            const file = if (place.world == 1) try std.fmt.bufPrint(&name, "{s}.{s}.f32", .{ t.name, path }) else try std.fmt.bufPrint(&name, "{s}.{s}.r{d}.f32", .{ t.name, path, place.rank });
++            try out.writeFile(io, .{ .sub_path = file, .data = std.mem.sliceAsBytes(x) });
++            std.debug.print("{s} {s}: {d} rows, last row argmax {d}\n", .{ t.name, path, t.ids.len, std.mem.indexOfMax(f32, x[(t.ids.len - 1) * real ..][0..real]) });
++        }
++        std.debug.print("{s}: {d:.2} s\n", .{ path, secs(io, t0) });
+     }
+     return 0;
+ }
+diff --git a/zig/src/families/inkling2/forward.zig b/zig/src/families/inkling2/forward.zig
+index e2eae65..65c328e 100644
+--- a/zig/src/families/inkling2/forward.zig
++++ b/zig/src/families/inkling2/forward.zig
+@@ -66,35 +66,39 @@ fn alloc(d: *const cuda.Driver, list: *std.ArrayList(Buf), gpa: std.mem.Allocato
+     return b.ptr;
+ }
+ 
+-/// One stream's caches and conv states: K and V rings a layer, the last three inputs of each short convolution.
++/// `slots` streams' caches and conv states: K and V rings a layer, the last three inputs of each short convolution.
+ pub const State = struct {
+     gpa: std.mem.Allocator,
+     bufs: std.ArrayList(Buf) = .empty,
+     kc: []u64 = &.{},
+     vc: []u64 = &.{},
+-    conv: [][4]u64 = &.{}, // k, v (fp32 [3][kv * 128]) and attention, MLP (fp32 [3][hidden]) a layer
+-    pos: usize = 0, // positions the caches hold
++    conv: [][4]u64 = &.{}, // k, v (fp32 [slots][3][kv * 128]) and attention, MLP (fp32 [slots][3][hidden]) a layer
++    pos: []usize = &.{}, // positions each slot's caches hold
++    ring: [2]usize = .{ 0, 0 }, // sliding and global ring slots a key head
+ 
+-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: *const cfg.Config, s: Shape) !State {
++    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, c: *const cfg.Config, s: Shape, slots: usize) !State {
+         var st: State = .{ .gpa = gpa };
+         errdefer st.deinit();
+         st.kc = try gpa.alloc(u64, c.layers);
+         st.vc = try gpa.alloc(u64, c.layers);
+         st.conv = try gpa.alloc([4]u64, c.layers);
++        st.pos = try gpa.alloc(usize, slots);
++        @memset(st.pos, 0);
++        st.ring = .{ s.sliding(c).ring, s.global().ring };
+         for (0..c.layers) |i| {
+             const ring: usize = s.layer(c, i).ring;
+-            st.kc[i] = try alloc(d, &st.bufs, gpa, s.kv * ring * c.head_dim * 2);
+-            st.vc[i] = try alloc(d, &st.bufs, gpa, s.kv * ring * c.head_dim * 2);
+-            for (0..2) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, 3 * s.kv * c.head_dim * 4);
+-            for (2..4) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, 3 * @as(usize, c.hidden) * 4);
++            st.kc[i] = try alloc(d, &st.bufs, gpa, slots * s.kv * ring * c.head_dim * 2);
++            st.vc[i] = try alloc(d, &st.bufs, gpa, slots * s.kv * ring * c.head_dim * 2);
++            for (0..2) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * s.kv * c.head_dim * 4);
++            for (2..4) |j| st.conv[i][j] = try alloc(d, &st.bufs, gpa, slots * 3 * @as(usize, c.hidden) * 4);
+         }
+         return st;
+     }
+ 
+-    /// Back to an empty stream: caches and conv states zeroed.
++    /// Back to empty streams: caches and conv states zeroed.
+     pub fn reset(st: *State) !void {
+         for (st.bufs.items) |b| try b.fill8(0, null);
+-        st.pos = 0;
++        @memset(st.pos, 0);
+     }
+ 
+     pub fn deinit(st: *State) void {
+@@ -103,9 +107,19 @@ pub const State = struct {
+         st.gpa.free(st.kc);
+         st.gpa.free(st.vc);
+         st.gpa.free(st.conv);
++        st.gpa.free(st.pos);
+     }
+ };
+ 
++/// Rows a grouped-experts call takes: its grouping kernel holds rows x 8 picks in 64 KiB of shared memory.
++const expert_rows = 2048;
++
++/// Most streams one call takes.
++pub const max_items = 64;
++
++/// One stream's rows in a call: its slot and the ids at its next positions.
++pub const Item = struct { slot: usize, ids: []const i32 };
++
+ /// A call's scratch, sized for Shape.rows rows.
+ pub const Buffers = struct {
+     gpa: std.mem.Allocator,
+@@ -152,7 +166,7 @@ pub const Buffers = struct {
+                 return alloc(dd, &bb.bufs, bb.gpa, bytes);
+             }
+         }.f;
+-        b.ids = try Buf.alloc(d, n * 12 + 64 + kernels.tileCount(n, c.group()) * 8 + 256);
++        b.ids = try Buf.alloc(d, n * 12 + max_items * (2 * @sizeOf(kernels.Seg) + 16) + (kernels.tileCount(n, c.group()) + max_items) * 8 + 256);
+         b.x = try A(&b, d, n * h * 2);
+         b.resid = try A(&b, d, n * h * 4);
+         b.blocks = try A(&b, d, ops.max_blocks * n * h * 2);
+@@ -238,35 +252,67 @@ pub const Forward = struct {
+         try f.m.dense.decode(f.stream, wt, x, .bf16, rows, y, dt);
+     }
+ 
+-    /// `ids` at the stream's next positions through every layer; the rows' logits land in b.logits.
+-    pub fn run(f: Forward, st: *State, ids: []const i32) !void {
++    /// Each item's ids at its stream's next positions through every layer; the rows' logits land in b.logits.
++    pub fn run(f: Forward, st: *State, items: []const Item) !void {
+         const c = &f.w.config;
+-        const n = ids.len;
+-        if (n == 0 or n > f.shape.rows or st.pos + n > f.shape.context) return error.Inkling2Rows;
++        var n: usize = 0;
++        for (items) |it| {
++            if (it.ids.len == 0 or st.pos[it.slot] + it.ids.len > f.shape.context) return error.Inkling2Rows;
++            n += it.ids.len;
++        }
++        if (n == 0 or n > f.shape.rows or items.len > max_items) return error.Inkling2Rows;
+         const h: usize = c.hidden;
+         const s = f.stream;
+         const k = &f.m.ops;
+         const b = f.b;
+-        const p0 = st.pos;
+-        // stage: ids, positions, segment of each row, the one segment, the attention tiles
+-        var host: std.ArrayList(u8) = .empty;
+-        defer host.deinit(f.w.gpa);
+         const gpa = f.w.gpa;
+-        try host.appendSlice(gpa, std.mem.sliceAsBytes(ids));
+-        for (0..n) |i| try host.appendSlice(gpa, std.mem.asBytes(&@as(i32, @intCast(p0 + i))));
+-        try host.appendNTimes(gpa, 0, n * 4);
+-        const seg_at = std.mem.alignForward(usize, host.items.len, 16);
+-        try host.appendNTimes(gpa, 0, seg_at - host.items.len);
+-        const seg = [_]kernels.Seg{.{ .row0 = 0, .n = @intCast(n), .p0 = @intCast(p0), .off = 0 }};
+-        try host.appendSlice(gpa, std.mem.sliceAsBytes(&seg));
+-        const tiles_at = host.items.len;
+-        var tl: [4096]kernels.Tile = undefined;
+-        const nt = try kernels.tiles(&seg, c.group(), &tl);
++        // stage: ids, positions, each row's segment, the sliding and global segments, conv segments, attention tiles
++        var host: std.ArrayList(u8) = .empty;
++        defer host.deinit(gpa);
++        for (items) |it| try host.appendSlice(gpa, std.mem.sliceAsBytes(it.ids));
++        for (items) |it| for (0..it.ids.len) |i| try host.appendSlice(gpa, std.mem.asBytes(&@as(i32, @intCast(st.pos[it.slot] + i))));
++        for (items, 0..) |it, j| for (0..it.ids.len) |_| try host.appendSlice(gpa, std.mem.asBytes(&@as(i32, @intCast(j))));
++        var segs: [2][max_items]kernels.Seg = undefined;
++        var cs: [max_items][4]i32 = undefined;
++        var first: usize = std.math.maxInt(usize);
++        var last: usize = 0;
++        var row0: usize = 0;
++        const per = [2]usize{ f.shape.kv * st.ring[0] * c.head_dim, f.shape.kv * st.ring[1] * c.head_dim };
++        for (items, 0..) |it, j| {
++            const p0 = st.pos[it.slot];
++            for (0..2) |r| segs[r][j] = .{ .row0 = @intCast(row0), .n = @intCast(it.ids.len), .p0 = @intCast(p0), .off = @intCast(it.slot * per[r]) };
++            cs[j] = .{ @intCast(row0), @intCast(it.ids.len), @intCast(it.slot), 0 };
++            first = @min(first, p0);
++            last = @max(last, p0 + it.ids.len - 1);
++            row0 += it.ids.len;
++        }
++        const ni = items.len;
++        var at: [5]usize = @splat(0);
++        try align16(gpa, &host);
++        at[0] = host.items.len;
++        try host.appendSlice(gpa, std.mem.sliceAsBytes(segs[0][0..ni]));
++        at[1] = host.items.len;
++        try host.appendSlice(gpa, std.mem.sliceAsBytes(segs[1][0..ni]));
++        at[2] = host.items.len;
++        try host.appendSlice(gpa, std.mem.sliceAsBytes(cs[0..ni]));
++        at[3] = host.items.len;
++        var tl: [8192]kernels.Tile = undefined;
++        const nt = try kernels.tiles(segs[0][0..ni], c.group(), &tl);
+         try host.appendSlice(gpa, std.mem.sliceAsBytes(tl[0..nt]));
+         try s.synchronize(); // the previous call's kernels may still read the staged rows
+         try b.ids.upload(0, host.items);
+         const base = b.ids.ptr;
+-        const rows: kernels.Rows = .{ .rows = @intCast(n), .heads = @intCast(f.shape.heads), .kv_heads = @intCast(f.shape.kv), .pos = base + n * 4, .seg_of = base + n * 8, .segs = base + seg_at, .tiles = base + tiles_at, .n_tiles = @intCast(nt), .last_pos = @intCast(p0 + n - 1), .first_pos = @intCast(p0) };
++        const rows_of = struct {
++            fn of(bb: u64, nn: usize, nti: usize, segs_at: usize, tiles_at: usize, heads: usize, kv: usize, fp: usize, lp: usize) kernels.Rows {
++                return .{ .rows = @intCast(nn), .heads = @intCast(heads), .kv_heads = @intCast(kv), .pos = bb + nn * 4, .seg_of = bb + nn * 8, .segs = bb + segs_at, .tiles = bb + tiles_at, .n_tiles = @intCast(nti), .last_pos = @intCast(lp), .first_pos = @intCast(fp) };
++            }
++        }.of;
++        const rows_by = [2]kernels.Rows{
++            rows_of(base, n, nt, at[0], at[3], f.shape.heads, f.shape.kv, first, last),
++            rows_of(base, n, nt, at[1], at[3], f.shape.heads, f.shape.kv, first, last),
++        };
++        const conv_segs = base + at[2];
++        const streams = ni;
+ 
+         try ops.embed(k, s, base, n, f.w.embed, f.w.embed_norm, b.x, h, c.eps);
+         var nb: usize = 0;
+@@ -293,9 +339,10 @@ pub const Forward = struct {
+                 try ops.rowdot(k, s, xk, a.k_proj, b.dk, n, f.shape.kv * c.conv, h, false, false);
+                 try ops.rowdot(k, s, xv, a.v_proj, b.dv, n, f.shape.kv * c.conv, h, false, false);
+             }
+-            try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw });
+-            try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw });
++            try ops.conv(k, s, .{ .x = b.kf, .state = cv[0], .w = a.k_conv, .dyn = if (global) b.dk else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.kraw, .segs = conv_segs, .state_stride = @intCast(3 * kvw) }, streams);
++            try ops.conv(k, s, .{ .x = b.vf, .state = cv[1], .w = a.v_conv, .dyn = if (global) b.dv else 0, .heads = @intCast(f.shape.kv), .c = @intCast(kvw), .rows = @intCast(n), .mode = 0, .out = b.vraw, .segs = conv_segs, .state_stride = @intCast(3 * kvw) }, streams);
+             const lay = f.shape.layer(c, i);
++            const rows = rows_by[@intFromBool(global)];
+             const prep: kernels.Prep = .{ .qk_clip = c.qk_clip, .rel_clip = c.rel_clip, .floor = c.log_floor, .alpha = c.log_alpha, .eps = c.eps };
+             try kernels.prep(&f.m.attn, s, rows, lay, prep, .{ b.q, b.kraw, b.vraw, b.r }, .{ a.q_scale, a.rel_scale }, b.qo, b.relo, st.kc[i], st.vc[i]);
+             try kernels.relTable(&f.m.attn, s, rows, b.relo, a.rel_proj, b.tab);
+@@ -308,16 +355,23 @@ pub const Forward = struct {
+                 try copy(f.d, b.blocks + nb * n * h * 2, b.x, n * h * 2, s);
+                 nb += 1;
+             }
+-            try ops.conv(k, s, .{ .x = ao.x, .parts = ao.parts, .part_stride = ao.stride, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1 });
++            try ops.conv(k, s, .{ .x = ao.x, .parts = ao.parts, .part_stride = ao.stride, .state = cv[2], .w = l.attn_conv, .base = if (boundary) 0 else b.x, .resid = b.resid, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 1, .segs = conv_segs, .state_stride = @intCast(3 * h) }, streams);
+             var mm: ops.MixArgs = .{ .partial = b.resid, .query = l.mlp_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 0, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+             for (0..nb) |j| mm.blocks[j] = b.blocks + j * n * h * 2;
+             mm.norm[0] = l.mlp_norm;
+             try ops.mix(k, s, mm);
+             try ops.rowdot(k, s, b.normed, l.router, b.scores, n, c.experts, h, false, true);
+             try ops.topk(k, s, b.scores, l.bias, b.pick, b.wts, n, c.experts, c.topk, c.route_scale);
+-            try experts.run(&f.m.experts, k, s, l.experts, .{ .gate = c.gate_softcap, .up = c.up_softcap }, b.normed, h, .bf16, b.pick, b.wts, n, f.slot(b.moe, n), b.exs);
++            const out = f.slot(b.moe, n);
++            var r0: usize = 0;
++            while (r0 < n) : (r0 += expert_rows) {
++                const w = @min(expert_rows, n - r0);
++                const caps: experts.Caps = .{ .gate = c.gate_softcap, .up = c.up_softcap };
++                const sel = r0 * c.topk * 4;
++                try experts.run(&f.m.experts, k, s, l.experts, caps, b.normed + r0 * h * 2, h, .bf16, b.pick + sel, b.wts + sel, w, out + r0 * h * 4, b.exs);
++            }
+             const mo = try f.summed(b.moe, n);
+-            try ops.conv(k, s, .{ .x = mo.x, .parts = mo.parts, .part_stride = mo.stride, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2 });
++            try ops.conv(k, s, .{ .x = mo.x, .parts = mo.parts, .part_stride = mo.stride, .state = cv[3], .w = l.mlp_conv, .resid = b.resid, .out = b.x, .round_in = 1, .c = @intCast(h), .rows = @intCast(n), .mode = 2, .segs = conv_segs, .state_stride = @intCast(3 * h) }, streams);
+         }
+         var fm: ops.MixArgs = .{ .partial = b.x, .query = f.w.out_query, .out = b.normed, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = 1, .rows = @intCast(n), .c = @intCast(h), .eps = c.eps };
+         for (0..nb) |j| fm.blocks[j] = b.blocks + j * n * h * 2;
+@@ -326,11 +380,15 @@ pub const Forward = struct {
+         const nv = f.w.share.vocab.len();
+         try f.dense(f.w.head, b.normed, n, b.logits.ptr, .f32);
+         try ops.softcap(k, s, b.logits.ptr, n * nv, c.logit_softcap);
+-        st.pos += n;
++        for (items) |it| st.pos[it.slot] += it.ids.len;
+     }
+ };
+ 
+ /// `bytes` from `src` to `dst` on the stream (a borrowed view of the destination).
++fn align16(gpa: std.mem.Allocator, host: *std.ArrayList(u8)) !void {
++    try host.appendNTimes(gpa, 0, std.mem.alignForward(usize, host.items.len, 16) - host.items.len);
++}
++
+ fn copy(d: *const cuda.Driver, dst: u64, src: u64, bytes: usize, s: cuda.Stream) !void {
+     const view: Buf = .{ .d = d, .ptr = dst, .len = bytes, .borrowed = true };
+     try view.copyFrom(0, src, bytes, s.handle);
+diff --git a/zig/src/families/inkling2/ops.zig b/zig/src/families/inkling2/ops.zig
+index ae51efd..996c15a 100644
+--- a/zig/src/families/inkling2/ops.zig
++++ b/zig/src/families/inkling2/ops.zig
+@@ -29,7 +29,9 @@ pub const ConvArgs = extern struct {
+     base: u64 = 0,
+     resid: u64 = 0,
+     out: u64 = 0,
++    segs: u64 = 0, // int4 per stream: row0, rows, state slot (0: one stream)
+     part_stride: i64 = 0, // elements between the ranks' partials of x (parts > 1)
++    state_stride: i64 = 0, // elements between the streams' states
+     parts: i32 = 1,
+     x_bf16: i32 = 0,
+     round_in: i32 = 0,
+@@ -137,11 +139,11 @@ pub fn gateup(k: *const Kernels, s: cuda.Stream, g: GateUpArgs) !void {
+     try go(k.gateup, s, .{ .x = @intCast(g.p), .y = @intCast(@divExact(g.n, 128)) }, 32, &a);
+ }
+ 
+-/// A short convolution over a stream's rows, its state carried (ops.cu's tf_ink2_conv).
+-pub fn conv(k: *const Kernels, s: cuda.Stream, c: ConvArgs) !void {
++/// A short convolution over each of `streams` streams' rows, their states carried (ops.cu's tf_ink2_conv).
++pub fn conv(k: *const Kernels, s: cuda.Stream, c: ConvArgs, streams: usize) !void {
+     var a: cuda.Args = .{};
+     a.add(c);
+-    try go(k.conv, s, .{ .x = @intCast(std.math.divCeil(i32, c.c, 128) catch unreachable) }, 128, &a);
++    try go(k.conv, s, .{ .x = @intCast(std.math.divCeil(i32, c.c, 128) catch unreachable), .y = @intCast(streams) }, 128, &a);
+ }
+ 
+ /// tanh(x / cap) * cap over `n` fp32 logits in place.
+@@ -155,6 +157,6 @@ pub fn softcap(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, cap: f32) !v
+ 
+ test "ops: the argument structs keep ops.cu's layouts" {
+     try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
+-    try std.testing.expectEqual(@as(usize, 8 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
++    try std.testing.expectEqual(@as(usize, 8 * 8 + 2 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
+     try std.testing.expectEqual(@as(usize, 6 * 8 + 6 * 4), @sizeOf(GateUpArgs));
+ }

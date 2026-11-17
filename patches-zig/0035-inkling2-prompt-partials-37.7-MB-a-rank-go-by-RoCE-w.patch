@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:14:35 +1100
+Subject: [PATCH 35/45] inkling2: prompt partials (37.7 MB a rank) go by RoCE
+ writes instead of NCCL over TCP
+
+---
+ zig/src/families/inkling2/engine.zig      | 5 +++++
+ zig/src/families/inkling2/engine_main.zig | 2 +-
+ zig/src/families/inkling2/native.zig      | 4 ++--
+ 3 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/zig/src/families/inkling2/engine.zig b/zig/src/families/inkling2/engine.zig
+index 5068d63..10c0bb7 100644
+--- a/zig/src/families/inkling2/engine.zig
++++ b/zig/src/families/inkling2/engine.zig
+@@ -190,6 +190,11 @@ pub const Engine = struct {
+         e.drafter = null;
+     }
+ 
++    /// The largest all-gather a rank sends (a prompt call's fp32 partial): RoCE writes take every gather up to it.
++    pub fn roceBytes(e: *const Engine) usize {
++        return prompt_rows * @as(usize, e.c.hidden) * 4;
++    }
++
+     fn convBytes(e: *const Engine) usize {
+         return @as(usize, e.c.layers) * 2 * 3 * (e.shape_d.kv * e.c.head_dim + e.c.hidden) * 4;
+     }
+diff --git a/zig/src/families/inkling2/engine_main.zig b/zig/src/families/inkling2/engine_main.zig
+index 1783fc8..22e5eef 100644
+--- a/zig/src/families/inkling2/engine_main.zig
++++ b/zig/src/families/inkling2/engine_main.zig
+@@ -52,7 +52,7 @@ pub fn main(init: std.process.Init) !u8 {
+     defer e.deinit();
+     if (place.world > 1) {
+         group = try cuda.tp_group.Group.open(&driver, place.rank, place.world);
+-        try group.?.openRoce(gpa, io, &driver, e.stream, 4096 << 10);
++        try group.?.openRoce(gpa, io, &driver, e.stream, e.roceBytes());
+         e.exchange = .{ .nccl = .{ .lib = &group.?.lib, .comm = group.?.comm, .group = &group.? } };
+     }
+     try e.reserve(16);
+diff --git a/zig/src/families/inkling2/native.zig b/zig/src/families/inkling2/native.zig
+index 1eac355..8741682 100644
+--- a/zig/src/families/inkling2/native.zig
++++ b/zig/src/families/inkling2/native.zig
+@@ -139,9 +139,9 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     errdefer own.e.deinit();
+     own.link = try follow.Link.init(gpa, ctx.d, &own.lib.?, own.comm, own.e.stream, @max(cap, engine.prompt_rows));
+     errdefer own.link.?.deinit();
+-    // small gathers by RoCE writes on two ranks, both or neither (TF_ROCE=0: NCCL); the plan word stays on NCCL
++    // gathers up to a prompt call's partial by RoCE writes, both ranks or neither (TF_ROCE=0: NCCL); plan word on NCCL
+     own.group = .{ .lib = own.lib.?, .comm = own.comm, .rank = p.rank, .world = p.world };
+-    try own.group.?.openRoce(gpa, io, ctx.d, own.e.stream, 4096 << 10);
++    try own.group.?.openRoce(gpa, io, ctx.d, own.e.stream, own.e.roceBytes());
+     errdefer if (own.group.?.fast) |f| f.deinit();
+     own.e.exchange = .{ .nccl = .{ .lib = &own.lib.?, .comm = own.comm, .group = &own.group.? } };
+     try load_cache.finishAfter(.{ io, own.e.checkpoint_digest }, cuda.tp_watch.ready);

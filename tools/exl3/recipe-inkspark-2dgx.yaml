@@ -1,0 +1,13 @@
+# inkspark-2dgx pack. Routed experts: gate+up 2 bits on all 48 layers (one width per layer);
+# down 3 bits on layers 0-11 and 36-47, 2 bits on 12-35. Attention linears (q, k, v, r, gate, o) 6 bits, head 8.
+# Router, norms, convolutions, sinks, attention-residual queries and the embedding stay as stored.
+target_bpw: 2.17
+head_bits: 8
+tensors:
+  "*.attn.*": 6
+  "*.mlp.experts.*.gate_proj": 2
+  "*.mlp.experts.*.up_proj": 2
+  "*.mlp.experts.*.down_proj": 3
+  "model.llm.layers.1[2-9].mlp.experts.*.down_proj": 2
+  "model.llm.layers.2[0-9].mlp.experts.*.down_proj": 2
+  "model.llm.layers.3[0-5].mlp.experts.*.down_proj": 2
