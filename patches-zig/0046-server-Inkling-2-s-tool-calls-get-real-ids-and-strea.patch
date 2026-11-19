@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ajensenwaud <ajensenwaud@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 19:08:02 +1100
+Subject: [PATCH] server: Inkling 2's tool calls get real ids and stream no
+ stray names
+
+Two faults made agents loop on tool calls.
+
+- Every call was id call_0: the Inkling split numbered calls within the reply, and the native branch in
+  openai_calls.zig passed ids through. Calls without a model-written id now take the request's keyed id, as parsed
+  calls already do; Kimi keeps its own.
+- A stream sent the tool name as text while the call's header was still open, before its block marker came. Clients
+  kept that text in history, and over a long run the model learned to write tool names as prose. The split now
+  holds an open header back until the reply finishes or its block says what it is.
+---
+ zig/src/server/chat_inkling.zig  |  7 +++----
+ zig/src/server/inkling_reply.zig | 19 ++++++++++++++++---
+ zig/src/server/openai_calls.zig  |  2 ++
+ 3 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/zig/src/server/chat_inkling.zig b/zig/src/server/chat_inkling.zig
+index bfb39483c..8ecd9f16e 100644
+--- a/zig/src/server/chat_inkling.zig
++++ b/zig/src/server/chat_inkling.zig
+@@ -14,16 +14,15 @@ pub fn is(text: anytype) bool {
+ /// The reply so far (ids past the prompt, specials spelled out) split as vLLM's Inkling parser splits it.
+ pub fn read(g: anytype, ids: []const u32, finished: bool) std.mem.Allocator.Error!@import("kimi_reply.zig").Result {
+     const raw = try g.srv.text.decode(g.a, ids);
+-    const r = split.split(g.a, raw) catch |e| return e;
++    const r = split.split(g.a, raw, finished) catch |e| return e;
+     var calls: ?[]Value = null;
+     if (g.tools.len > 0 and r.calls.len > 0) {
+-        const list = try g.a.alloc(Value, r.calls.len);
+-        for (r.calls, list, 0..) |c, *v, i| {
++        const list = try g.a.alloc(Value, r.calls.len); // no ids: the model writes none (openai_calls.zig keys them)
++        for (r.calls, list) |c, *v| {
+             const f = try json.newObject(g.a);
+             try f.put(g.a, "name", .{ .string = c.name });
+             try f.put(g.a, "arguments", .{ .string = c.arguments });
+             const o = try json.newObject(g.a);
+-            try o.put(g.a, "id", .{ .string = try std.fmt.allocPrint(g.a, "call_{d}", .{i}) });
+             try o.put(g.a, "type", .{ .string = "function" });
+             try o.put(g.a, "function", .{ .object = f });
+             v.* = .{ .object = o };
+diff --git a/zig/src/server/inkling_reply.zig b/zig/src/server/inkling_reply.zig
+index ac9a39ce2..9fef7f466 100644
+--- a/zig/src/server/inkling_reply.zig
++++ b/zig/src/server/inkling_reply.zig
+@@ -46,7 +46,8 @@ fn next(s: State, m: Marker) ?State {
+ }
+ 
+ /// Split one reply's text (special tokens spelled out). Every slice is allocated from `a` (an arena suits).
+-pub fn split(a: std.mem.Allocator, reply: []const u8) !Reply {
++/// A header still open in an unfinished reply is held back: it may yet name a tool, and a stream cannot take text back.
++pub fn split(a: std.mem.Allocator, reply: []const u8, finished: bool) !Reply {
+     var reasoning: std.ArrayList(u8) = .empty;
+     var content: std.ArrayList(u8) = .empty;
+     var header: std.ArrayList(u8) = .empty;
+@@ -80,7 +81,7 @@ pub fn split(a: std.mem.Allocator, reply: []const u8) !Reply {
+         .calls = calls.items,
+     };
+     if (state == .tool) out.cut = name(payload.items);
+-    if (state == .header and header.items.len > 0) out.content = try std.mem.concat(a, u8, &.{ content.items, header.items });
++    if (finished and state == .header and header.items.len > 0) out.content = try std.mem.concat(a, u8, &.{ content.items, header.items });
+     const blank = std.mem.trim(u8, out.content, " \t\r\n").len == 0;
+     if (blank and (out.calls.len > 0 or out.cut != null)) out.content = "";
+     return out;
+@@ -164,7 +165,7 @@ fn name(payload: []const u8) ?[]const u8 {
+ const t = std.testing;
+ 
+ fn splitT(arena: *std.heap.ArenaAllocator, text: []const u8) !Reply {
+-    return split(arena.allocator(), text);
++    return split(arena.allocator(), text, true);
+ }
+ 
+ test "inkling2 reply: a chat turn gives its reasoning and its answer" {
+@@ -226,3 +227,15 @@ test "inkling2 reply: a marker vLLM's table does not take in a state stays text"
+     try t.expectEqualStrings("a<|content_text|>b", r.reasoning);
+     try t.expectEqualStrings("", r.content);
+ }
++
++test "inkling2 reply: a stream holds back a header until its block says what it is" {
++    var arena = std.heap.ArenaAllocator.init(t.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const so_far = "<|message_model|><|content_thinking|>List /tmp.<|end_message|><|message_model|>run_shell";
++    try t.expectEqualStrings("", (try split(a, so_far, false)).content);
++    const named = try split(a, so_far ++ "_command<|content_invoke_tool_json|>{\"name\":\"run_shell_command\"}<|end_message|>", false);
++    try t.expectEqualStrings("", named.content);
++    try t.expectEqualStrings("run_shell_command", named.calls[0].name);
++    try t.expectEqualStrings("Hi", (try split(a, "<|message_model|>Hi", true)).content);
++}
+diff --git a/zig/src/server/openai_calls.zig b/zig/src/server/openai_calls.zig
+index ad639ceba..e4ba94da2 100644
+--- a/zig/src/server/openai_calls.zig
++++ b/zig/src/server/openai_calls.zig
+@@ -21,6 +21,8 @@ pub fn attach(r: anytype, reply: *chat.Reply) Allocator.Error!?[]Value {
+         reply.content = try r.plan.policy.parsedContent(r.a, reply.content);
+         reply.finish_reason = "tool_calls";
+         reply.tool_calls_streamed = false;
++        // calls the model wrote no ids for (Inkling 2) take the request's, as parsed calls do; Kimi's keep their own
++        for (calls, 0..) |c, i| if (c == .object and !c.object.contains("id")) try c.object.put(r.a, "id", .{ .string = try r.call_ids.id(r.a, choice, i) });
+         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+     }
+     const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+-- 
+2.53.0
+
